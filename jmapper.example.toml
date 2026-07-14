@@ -1,0 +1,66 @@
+[server]
+bind = "127.0.0.1:8765"
+session_url = "http://localhost:8765"
+cors_origins = ["http://localhost:3000", "http://localhost:5173"]
+# libpq-style connection string; unix socket peer auth is the intended
+# production shape (`host=/run/postgresql`), TCP works for dev.
+database_url = "host=/tmp dbname=jmapper"
+# CalDAV/CardDAV refresh cadence. Set to 0 to disable periodic refresh.
+dav_sync_interval_seconds = 60
+
+[[accounts]]
+id = "me-gmail"
+email = "you@gmail.com"
+display_name = "Personal"
+provider = "gmail"
+bearer_token = "REPLACE_ME_WITH_A_RANDOM_STRING"
+backfill_days = 90
+
+[accounts.gmail]
+app_password = "abcd efgh ijkl mnop"
+
+# Optional DAV endpoints. Each endpoint may use auth = "none", "basic", or
+# "bearer". These tokens are independent of the Gmail IMAP OAuth bootstrap.
+# [accounts.caldav]
+# url = "https://dav-provider.example/calendars/you/"
+# auth = "bearer"
+# token = "CURRENT_DAV_ACCESS_TOKEN"
+#
+# [accounts.carddav]
+# url = "https://dav-provider.example/addressbooks/you/"
+# auth = "bearer"
+# token = "CURRENT_DAV_ACCESS_TOKEN"
+
+# [[accounts]]
+# id = "me-fastmail"
+# email = "you@fastmail.com"
+# display_name = "Work"
+# provider = "imap"
+# bearer_token = "REPLACE_ME"
+#
+# [accounts.imap]
+# host = "imap.fastmail.com"
+# port = 993
+# tls = "implicit"            # or "starttls" for port 143
+# username = "you@fastmail.com"
+# password = "app-specific-password"
+#
+# Without [accounts.smtp] the account can read and organize mail but
+# EmailSubmission/set is refused. username/password fall back to the IMAP
+# credentials when unset.
+# [accounts.smtp]
+# host = "smtp.fastmail.com"
+# port = 465
+# tls = "implicit"            # or "starttls" for port 587
+#
+# [accounts.caldav]
+# url = "https://caldav.fastmail.com/"
+# auth = "basic"
+# username = "you@fastmail.com"
+# password = "app-specific-password"
+#
+# [accounts.carddav]
+# url = "https://carddav.fastmail.com/"
+# auth = "basic"
+# username = "you@fastmail.com"
+# password = "app-specific-password"
