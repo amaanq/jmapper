@@ -1,0 +1,44 @@
+[package]
+name = "imap-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+jmap-protocol = { version = "0.1.0", path = "../jmap-protocol" }
+
+tokio.workspace = true
+futures.workspace = true
+
+async-imap.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
+webpki-roots.workspace = true
+
+oauth2.workspace = true
+reqwest.workspace = true
+
+tokio-postgres.workspace = true
+deadpool-postgres.workspace = true
+jmapper-codegen = { version = "0.0.0", path = "../jmapper-codegen" }
+mail-parser.workspace = true
+mail-send.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+
+tracing.workspace = true
+thiserror.workspace = true
+
+sha1.workspace = true
+hex.workspace = true
+base64.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

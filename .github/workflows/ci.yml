@@ -1,0 +1,73 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: short
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt + clippy + test (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
+          - macos-26
+    env:
+      JMAPPER_TEST_DB_URL: host=127.0.0.1 user=postgres dbname=jmapper_test
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - uses: cachix/install-nix-action@b97f05dcb019ddea06450a50ef6203d2fdc19fee # v31
+
+      - name: cargo fmt
+        run: nix develop --command cargo fmt --all --check
+
+      - name: cargo clippy
+        run: nix develop --command cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Start PostgreSQL
+        run: |
+          nix develop --command initdb --auth=trust --username=postgres --pgdata "$RUNNER_TEMP/postgres"
+          nix develop --command pg_ctl --pgdata "$RUNNER_TEMP/postgres" --options="-h 127.0.0.1 -p 5432" --log="$RUNNER_TEMP/postgres.log" --wait start
+          nix develop --command createdb --host=127.0.0.1 --username=postgres jmapper_test
+
+      - name: cargo test (DB-backed, hard gate)
+        run: nix develop --command env JMAPPER_REQUIRE_DB_TESTS=1 cargo test --workspace --all-features --locked
+
+      - name: nix build
+        run: nix build .#jmapper -L
+
+      - name: smoke-test the binary
+        run: |
+          ./result/bin/jmapper --version
+          ./result/bin/jmapper --help
+
+      - name: Stop PostgreSQL
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/postgres/postmaster.pid" ]]; then
+            nix develop --command pg_ctl --pgdata "$RUNNER_TEMP/postgres" --mode=fast --wait stop
+          fi
+
+  audit:
+    name: cargo-deny
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - uses: cachix/install-nix-action@b97f05dcb019ddea06450a50ef6203d2fdc19fee # v31
+      - run: nix develop --command cargo deny --workspace --all-features check

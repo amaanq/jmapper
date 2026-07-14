@@ -1,0 +1,38 @@
+# Ignore everything; whitelist real project files explicitly.
+*
+
+# Top-level
+!.editorconfig
+!.gitignore
+!.rustfmt.toml
+!.taplo.toml
+!.tack/
+!.tack/**
+!Cargo.lock
+!Cargo.toml
+!DESIGN.md
+!README.md
+!cornucopia.toml
+!deny.toml
+!flake.nix
+!jmapper.example.toml
+!schema.sql
+
+# Crates
+!crates/
+!crates/**
+crates/**/target/
+crates/**/target/**
+crates/**/Cargo.lock
+
+# Queries
+!queries/
+!queries/**
+
+# Nix
+!nix/
+!nix/**
+
+# CI
+!.github/
+!.github/**

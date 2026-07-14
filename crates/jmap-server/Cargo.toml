@@ -1,0 +1,51 @@
+[package]
+name = "jmap-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+jmap-protocol = { version = "0.1.0", path = "../jmap-protocol" }
+imap-sync = { version = "0.1.0", path = "../imap-sync" }
+dav-sync = { version = "0.1.0", path = "../dav-sync" }
+
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+
+tokio-postgres.workspace = true
+deadpool-postgres.workspace = true
+jmapper-codegen = { version = "0.0.0", path = "../jmapper-codegen" }
+
+tracing.workspace = true
+thiserror.workspace = true
+
+subtle.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+hex.workspace = true
+arc-swap.workspace = true
+base64.workspace = true
+
+mail-parser.workspace = true
+mail-builder.workspace = true
+percent-encoding.workspace = true
+tokio-stream.workspace = true
+futures-util.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+bytes = "1"
+
+[lints]
+workspace = true

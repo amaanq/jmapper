@@ -1,0 +1,176 @@
+[workspace]
+exclude = [ "crates/jmapper-codegen" ]
+members = [
+	"crates/jmap-protocol",
+	"crates/imap-sync",
+	"crates/jmap-server",
+	"crates/jmapper",
+	"crates/dav-sync",
+]
+resolver = "2"
+
+[workspace.package]
+authors      = [ "Amaan Qureshi <contact@amaanq.com>" ]
+edition      = "2024"
+license      = "MPL"
+publish      = false
+rust-version = "1.96.0"
+version      = "0.1.0"
+
+[workspace.dependencies]
+# HTTP
+axum       = { features = [ "macros" ], version = "0.8.9" }
+tower      = "0.5.3"
+tower-http = { features = [ "cors", "trace" ], version = "0.7.0" }
+
+# IMAP
+async-imap       = { default-features = false, features = [ "runtime-tokio" ], version = "0.11.3" }
+rustls-pki-types = "1.15.0"
+webpki-roots     = "1.0.9"
+
+# OAuth
+oauth2  = { default-features = false, features = [ "reqwest", "rustls-tls" ], version = "5.0.0" }
+reqwest = { default-features = false, features = [ "rustls-tls", "json" ], version = "0.12" }
+
+# Database
+deadpool-postgres = { features = [ "rt_tokio_1" ], version = "0.14.1" }
+tokio-postgres    = "0.7.18"
+
+# Protocol parsing and generation
+calcard      = { default-features = false, features = [ "jmap" ], version = "0.3.6" }
+mail-builder = { default-features = false, version = "0.4.4" }
+mail-parser  = "0.11.5"
+mail-send    = { default-features = false, features = [ "ring", "tls12" ], version = "0.6.1" }
+quick-xml    = "0.41.0"
+
+# Serde
+serde      = { features = [ "derive" ], version = "1.0.228" }
+serde_json = "1.0.150"
+toml       = "1.1.3"
+
+# Tracing
+tracing            = "0.1.44"
+tracing-subscriber = { features = [ "env-filter", "json" ], version = "0.3.23" }
+
+# CLI
+clap = { features = [ "derive", "env" ], version = "4.6.2" }
+
+# Errors
+anyhow    = "1.0.103"
+thiserror = "2.0.18"
+
+# Time
+chrono    = { default-features = false, features = [ "serde", "clock" ], version = "0.4.45" }
+chrono-tz = "0.10.4"
+
+# Utility
+arc-swap = "1.9.2"
+base64 = "0.22.1"
+futures = "0.3.33"
+futures-util = "0.3.33"
+hex = "0.4.3"
+percent-encoding = "2.3.2"
+rand = "0.10.2"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+subtle = "2.6.1"
+tokio = {
+	features = [
+		"rt-multi-thread",
+		"macros",
+		"net",
+		"sync",
+		"time",
+		"signal",
+		"fs",
+		"io-util",
+	],
+	version = "1.53.0",
+}
+tokio-rustls = {
+	default-features = false,
+	features = [
+		"ring",
+		"logging",
+		"tls12",
+	],
+	version = "0.26.4",
+}
+tokio-stream = { features = [ "sync" ], version = "0.1.18" }
+url = "2.5.8"
+webbrowser = "1.2.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+cargo    = { level = "warn", priority = -1 }
+nursery  = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+blanket_clippy_restriction_lints = "allow"
+restriction                      = { level = "warn", priority = -1 }
+
+arbitrary_source_item_ordering  = "allow"
+arithmetic_side_effects         = "allow"
+as_conversions                  = "allow"
+big_endian_bytes                = "allow"
+cast_possible_truncation        = "allow"
+cast_possible_wrap              = "allow"
+cast_sign_loss                  = "allow"
+cognitive_complexity            = "allow"
+default_numeric_fallback        = "allow"
+else_if_without_else            = "allow"
+error_impl_error                = "allow"
+exhaustive_enums                = "allow"
+exhaustive_structs              = "allow"
+expect_used                     = "allow"
+float_arithmetic                = "allow"
+impl_trait_in_params            = "allow"
+implicit_return                 = "allow"
+indexing_slicing                = "allow"
+infinite_loop                   = "allow"
+integer_division                = "allow"
+integer_division_remainder_used = "allow"
+iter_over_hash_type             = "allow"
+let_underscore_must_use         = "allow"
+let_underscore_untyped          = "allow"
+little_endian_bytes             = "allow"
+map_err_ignore                  = "allow"
+missing_docs_in_private_items   = "allow"
+missing_inline_in_public_items  = "allow"
+mod_module_files                = "allow"
+module_name_repetitions         = "allow"
+multiple_crate_versions         = "allow"
+needless_borrowed_reference     = "allow"
+non_ascii_literal               = "allow"
+pattern_type_mismatch           = "allow"
+print_stderr                    = "allow"
+print_stdout                    = "allow"
+pub_use                         = "allow"
+pub_with_shorthand              = "allow"
+question_mark_used              = "allow"
+ref_patterns                    = "allow"
+semicolon_outside_block         = "allow"
+separated_literal_suffix        = "allow"
+shadow_reuse                    = "allow"
+shadow_unrelated                = "allow"
+similar_names                   = "allow"
+single_call_fn                  = "allow"
+single_char_lifetime_names      = "allow"
+std_instead_of_alloc            = "allow"
+std_instead_of_core             = "allow"
+string_slice                    = "allow"
+struct_excessive_bools          = "allow"
+tests_outside_test_module       = "allow"
+too_many_lines                  = "allow"
+unimplemented                   = "allow"
+unreachable                     = "allow"
+unwrap_in_result                = "allow"
+unwrap_used                     = "allow"
+wildcard_enum_match_arm         = "allow"
+
+[profile.release]
+codegen-units = 1
+lto           = "thin"
+strip         = true

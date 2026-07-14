@@ -1,0 +1,17 @@
+[package]
+name = "jmap-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+pretty_assertions = "1"
+
+[lints]
+workspace = true
