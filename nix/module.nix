@@ -171,6 +171,7 @@ in
         Group = cfg.group;
         Restart = "on-failure";
         RestartSec = 5;
+        TimeoutStopSec = 30;
         StateDirectory = cfg.user;
         StateDirectoryMode = "0750";
         RuntimeDirectory = "jmapper";

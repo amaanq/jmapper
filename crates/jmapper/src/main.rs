@@ -2,6 +2,7 @@
 
 use std::{
    collections::HashMap,
+   future::IntoFuture as _,
    path::PathBuf,
    sync::Arc,
    time::Duration,
@@ -26,10 +27,13 @@ use dav_sync::{
 use tokio::{
    net::TcpListener,
    signal,
+   sync::oneshot,
    task::JoinSet,
    time,
 };
 use tracing::info;
+
+const HTTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 mod bootstrap;
 mod config;
@@ -193,10 +197,28 @@ async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
       .with_context(|| format!("binding {}", config.server.bind))?;
    info!(bind = %config.server.bind, "jmapper listening");
 
-   axum::serve(listener, router)
-      .with_graceful_shutdown(shutdown_signal())
-      .await
-      .context("axum serve")?;
+   let (shutdown_started_tx, shutdown_started_rx) = oneshot::channel();
+   let server = axum::serve(listener, router)
+      .with_graceful_shutdown(async move {
+         shutdown_signal().await;
+         let _ = shutdown_started_tx.send(());
+      })
+      .into_future();
+   tokio::pin!(server);
+   tokio::select! {
+      result = &mut server => result.context("axum serve")?,
+      _ = shutdown_started_rx => {
+         match time::timeout(HTTP_SHUTDOWN_TIMEOUT, &mut server).await {
+            Ok(result) => result.context("axum serve")?,
+            Err(_) => {
+               tracing::warn!(
+                  timeout_secs = HTTP_SHUTDOWN_TIMEOUT.as_secs(),
+                  "HTTP drain timed out; closing long-lived connections",
+               );
+            },
+         }
+      },
+   }
 
    shutdown_accounts(&ctx).await;
 
