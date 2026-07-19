@@ -828,14 +828,14 @@ pub async fn query_changes(
 /// address's display name (fallback address) so the result matches what a
 /// client renders in its list column.
 struct SortTerm {
-   expression: &'static str,
+   expression: String,
    direction:  &'static str,
 }
 
 fn email_sort_terms(comparators: Option<&[Comparator]>) -> Result<Vec<SortTerm>, MethodError> {
    let Some(comparators) = comparators.filter(|comparators| !comparators.is_empty()) else {
       return Ok(vec![SortTerm {
-         expression: "m.received_at",
+         expression: "m.received_at".into(),
          direction:  "DESC",
       }]);
    };
@@ -843,16 +843,38 @@ fn email_sort_terms(comparators: Option<&[Comparator]>) -> Result<Vec<SortTerm>,
    comparators
       .iter()
       .map(|comparator| {
-         if comparator.collation.is_some() || !comparator.extra.is_empty() {
+         if comparator.collation.is_some() {
+            return Err(MethodError::UnsupportedSort);
+         }
+         let direction = if comparator.is_ascending { "ASC" } else { "DESC" };
+         // hasKeyword (RFC 8621 §4.4.2) carries the keyword as a comparator
+         // argument; the expression mirrors the hasKeyword filter's substring
+         // probe of the JSON flag array. Boolean sort, so DESC puts emails
+         // carrying the keyword first. The needle is inlined as an escaped
+         // literal because sort expressions cannot carry binds: they are
+         // repeated in the collapseThreads projection ahead of the WHERE
+         // binds, which would break the placeholder numbering.
+         if comparator.property == "hasKeyword" {
+            let Some(serde_json::Value::String(keyword)) = comparator.extra.get("keyword") else {
+               return Err(MethodError::UnsupportedSort);
+            };
+            if comparator.extra.len() > 1 {
+               return Err(MethodError::UnsupportedSort);
+            }
+            let needle = format!("\"{}\"", keyword_to_flag(keyword)).replace('\'', "''");
+            return Ok(SortTerm {
+               expression: format!("(strpos(m.flags_json, '{needle}') > 0)"),
+               direction,
+            });
+         }
+         if !comparator.extra.is_empty() {
             return Err(MethodError::UnsupportedSort);
          }
          Ok(SortTerm {
-            expression: sort_expr(&comparator.property).ok_or(MethodError::UnsupportedSort)?,
-            direction:  if comparator.is_ascending {
-               "ASC"
-            } else {
-               "DESC"
-            },
+            expression: sort_expr(&comparator.property)
+               .ok_or(MethodError::UnsupportedSort)?
+               .into(),
+            direction,
          })
       })
       .collect::<Result<Vec<_>, _>>()
@@ -1276,6 +1298,21 @@ mod filter_tests {
       assert_eq!(terms[0].direction, "ASC");
       assert_eq!(terms[1].expression, "m.received_at");
       assert_eq!(terms[1].direction, "DESC");
+   }
+
+   #[test]
+   fn has_keyword_sort_compiles() {
+      let comparators = serde_json::from_value::<Vec<Comparator>>(serde_json::json!([
+          {"property": "hasKeyword", "keyword": "$pinned", "isAscending": false},
+          {"property": "receivedAt", "isAscending": false}
+      ]))
+      .unwrap();
+      let terms = email_sort_terms(Some(&comparators)).unwrap();
+
+      assert_eq!(terms.len(), 2);
+      assert_eq!(terms[0].expression, r#"(strpos(m.flags_json, '"$pinned"') > 0)"#);
+      assert_eq!(terms[0].direction, "DESC");
+      assert_eq!(terms[1].expression, "m.received_at");
    }
 
    #[test]
