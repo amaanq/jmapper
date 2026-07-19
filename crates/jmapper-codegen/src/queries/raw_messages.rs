@@ -27,6 +27,7 @@ pub struct CachedMessageIdsParams<
 #[derive(Debug)]
 pub struct RecentUncachedMessageIdsParams<T1: crate::StringSql> {
     pub account_id: T1,
+    pub window: i64,
     pub max_bytes: i64,
     pub limit: i64,
 }
@@ -671,7 +672,7 @@ impl<
 pub struct RecentUncachedMessageIdsStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn recent_uncached_message_ids() -> RecentUncachedMessageIdsStmt {
     RecentUncachedMessageIdsStmt(
-        "SELECT m.msgid FROM messages m LEFT JOIN raw_messages r ON r.account_id = m.account_id AND r.msgid = m.msgid WHERE m.account_id = $1 AND r.msgid IS NULL AND m.size <= $2 ORDER BY m.received_at DESC LIMIT $3",
+        "WITH recent AS ( SELECT account_id, msgid, received_at, size FROM messages WHERE account_id = $1 ORDER BY received_at DESC LIMIT $2 ) SELECT m.msgid FROM recent m LEFT JOIN raw_messages r ON r.account_id = m.account_id AND r.msgid = m.msgid WHERE r.msgid IS NULL AND m.size <= $3 ORDER BY m.received_at DESC LIMIT $4",
         None,
     )
 }
@@ -687,12 +688,13 @@ impl RecentUncachedMessageIdsStmt {
         &'s self,
         client: &'c C,
         account_id: &'a T1,
+        window: &'a i64,
         max_bytes: &'a i64,
         limit: &'a i64,
-    ) -> StringQuery<'c, 'a, 's, C, String, 3> {
+    ) -> StringQuery<'c, 'a, 's, C, String, 4> {
         StringQuery {
             client,
-            params: [account_id, max_bytes, limit],
+            params: [account_id, window, max_bytes, limit],
             query: self.0,
             cached: self.1.as_ref(),
             extractor: |row| Ok(row.try_get(0)?),
@@ -706,7 +708,7 @@ impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>
         'a,
         's,
         RecentUncachedMessageIdsParams<T1>,
-        StringQuery<'c, 'a, 's, C, String, 3>,
+        StringQuery<'c, 'a, 's, C, String, 4>,
         C,
     > for RecentUncachedMessageIdsStmt
 {
@@ -714,8 +716,14 @@ impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>
         &'s self,
         client: &'c C,
         params: &'a RecentUncachedMessageIdsParams<T1>,
-    ) -> StringQuery<'c, 'a, 's, C, String, 3> {
-        self.bind(client, &params.account_id, &params.max_bytes, &params.limit)
+    ) -> StringQuery<'c, 'a, 's, C, String, 4> {
+        self.bind(
+            client,
+            &params.account_id,
+            &params.window,
+            &params.max_bytes,
+            &params.limit,
+        )
     }
 }
 pub struct UpsertRawMessageStmt(&'static str, Option<tokio_postgres::Statement>);
