@@ -1550,11 +1550,25 @@ mod tests {
               "2026-07-16T09:00:00": {"start": "2026-07-16T10:00:00"}
           }
       });
-      let raw = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:r1\r\nDTSTART:\
-                 20260702T090000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nBEGIN:\
-                 VEVENT\r\nUID:r1\r\nRECURRENCE-ID:20260716T090000Z\r\nDTSTART:20260716T100000Z\r\\
-                 \
-                 nDURATION:PT1H\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+      let raw = [
+         "BEGIN:VCALENDAR",
+         "VERSION:2.0",
+         "BEGIN:VEVENT",
+         "UID:r1",
+         "DTSTART:20260702T090000Z",
+         "DURATION:PT1H",
+         "RRULE:FREQ=WEEKLY",
+         "END:VEVENT",
+         "BEGIN:VEVENT",
+         "UID:r1",
+         "RECURRENCE-ID:20260716T090000Z",
+         "DTSTART:20260716T100000Z",
+         "DURATION:PT1H",
+         "END:VEVENT",
+         "END:VCALENDAR",
+         "",
+      ]
+      .join("\r\n");
       let explicit_override = EventFilter {
          after: Some("2026-07-16T09:30:00".parse().unwrap()),
          before: Some("2026-07-16T10:30:00".parse().unwrap()),
@@ -1566,8 +1580,8 @@ mod tests {
          ..EventFilter::default()
       };
 
-      assert!(event_date_matches(&value, Some(raw), &explicit_override, chrono_tz::UTC).unwrap());
-      assert!(event_date_matches(&value, Some(raw), &generated_instance, chrono_tz::UTC).unwrap());
+      assert!(event_date_matches(&value, Some(&raw), &explicit_override, chrono_tz::UTC).unwrap());
+      assert!(event_date_matches(&value, Some(&raw), &generated_instance, chrono_tz::UTC).unwrap());
    }
 
    #[test]

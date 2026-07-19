@@ -258,12 +258,27 @@ mod tests {
 
    #[test]
    fn recurrence_overrides_survive() {
-      let raw = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:r1\r\nDTSTART:\
-                 20260715T100000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\nEXDATE:\
-                 20260722T100000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:r1\r\nRECURRENCE-ID:\
-                 20260729T100000Z\r\nDTSTART:20260729T120000Z\r\nDURATION:PT1H\r\nEND:VEVENT\r\\
-                 nEND:VCALENDAR\r\n";
-      let (_, event) = ical_to_event(raw).unwrap();
+      let raw = [
+         "BEGIN:VCALENDAR",
+         "VERSION:2.0",
+         "BEGIN:VEVENT",
+         "UID:r1",
+         "DTSTART:20260715T100000Z",
+         "DURATION:PT1H",
+         "RRULE:FREQ=WEEKLY;COUNT=3",
+         "EXDATE:20260722T100000Z",
+         "END:VEVENT",
+         "BEGIN:VEVENT",
+         "UID:r1",
+         "RECURRENCE-ID:20260729T100000Z",
+         "DTSTART:20260729T120000Z",
+         "DURATION:PT1H",
+         "END:VEVENT",
+         "END:VCALENDAR",
+         "",
+      ]
+      .join("\r\n");
+      let (_, event) = ical_to_event(&raw).unwrap();
       assert!(event["recurrenceRule"].is_object());
       assert!(event["recurrenceOverrides"].is_object());
       let output = event_to_ical(&event).unwrap();

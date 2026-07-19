@@ -451,11 +451,21 @@ async fn start_server(state: Shared) -> String {
 const ACCOUNT: &str = "acct1";
 
 fn ical(uid: &str, summary: &str) -> String {
-   format!(
-      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Mock//EN\r\nBEGIN:VEVENT\r\nUID:{uid}\r\\
-       nDTSTAMP:20260401T120000Z\r\nDTSTART;TZID=Europe/Berlin:20260406T100000\r\nDURATION:PT1H\r\\
-       nSUMMARY:{summary}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-   )
+   [
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//Mock//EN",
+      "BEGIN:VEVENT",
+      &format!("UID:{uid}"),
+      "DTSTAMP:20260401T120000Z",
+      "DTSTART;TZID=Europe/Berlin:20260406T100000",
+      "DURATION:PT1H",
+      &format!("SUMMARY:{summary}"),
+      "END:VEVENT",
+      "END:VCALENDAR",
+      "",
+   ]
+   .join("\r\n")
 }
 
 fn vcard(uid: &str, name: &str) -> String {
