@@ -69,7 +69,7 @@ UPDATE messages
 SET subject = :subject, preview = :preview, has_attachment = :has_attachment, modseq = :modseq
 WHERE account_id = :account_id AND msgid = :msgid;
 
---: MessageAddressesRow(thread_id?, to_json?, cc_json?, bcc_json?)
+--: MessageAddressesRow(to_json?, cc_json?, bcc_json?)
 
 --! message_addresses : MessageAddressesRow
 SELECT thrid AS thread_id, to_json, cc_json, bcc_json

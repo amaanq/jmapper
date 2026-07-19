@@ -1365,6 +1365,107 @@ async fn thread_get_null_ids_returns_all() {
    );
 }
 
+#[tokio::test]
+async fn email_submission_resolves_created_email_id() {
+   use chrono::Utc;
+   use imap_sync::db::MessageEnvelope;
+   use jmap_protocol::email::EmailAddress;
+
+   let Some(pool) = setup_pool().await else {
+      return;
+   };
+   db::upsert_account(&pool, "acctA", "a@x.com", ProviderKind::Imap, "A", b"h")
+      .await
+      .unwrap();
+   db::upsert_message(&pool, "acctA", &MessageEnvelope {
+      msgid:              "m1".into(),
+      thrid:              "t1".into(),
+      flags:              vec!["$draft".into()],
+      received_at:        Utc::now(),
+      sent_at:            None,
+      size:               1,
+      from:               Some(vec![EmailAddress {
+         name:  None,
+         email: "a@x.com".into(),
+      }]),
+      to:                 Some(vec![EmailAddress {
+         name:  None,
+         email: "b@x.com".into(),
+      }]),
+      cc:                 None,
+      bcc:                None,
+      reply_to:           None,
+      subject:            Some("hi".into()),
+      preview:            None,
+      has_attachment:     false,
+      message_id_header:  None,
+      in_reply_to_header: None,
+      references_header:  None,
+   })
+   .await
+   .unwrap();
+
+   let (tx, mut rx) = mpsc::channel::<AccountRequest>(1);
+   tokio::spawn(async move {
+      let Some(AccountRequest::SubmitEmail {
+         msgid,
+         mail_from,
+         rcpt_to,
+         respond,
+      }) = rx.recv().await
+      else {
+         return;
+      };
+      assert_eq!(msgid, "m1");
+      assert_eq!(mail_from, "a@x.com");
+      assert_eq!(rcpt_to, ["b@x.com"]);
+      let _ = respond.send(Ok("250 2.0.0 queued".into()));
+   });
+
+   let token = "bearer-A-abcdef0123456789";
+   let state = AppState::new(
+      pool,
+      vec![AccountInfo::from_bearer_token(
+         "acctA", "a@x.com", "A", token,
+      )],
+      "http://test.invalid".to_owned(),
+      HashMap::from([("acctA".to_owned(), tx)]),
+   );
+   let router = build_router(state, vec!["http://example.test".into()]);
+   let body = serde_json::json!({
+       "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:submission"],
+       "createdIds": {"draft": "m1"},
+       "methodCalls": [[
+           "EmailSubmission/set",
+           {"accountId": "acctA", "create": {"send": {
+               "emailId": "#draft",
+               "identityId": "ident-acctA"
+           }}},
+           "c0"
+       ]]
+   });
+   let response = router
+      .oneshot(
+         Request::builder()
+            .method("POST")
+            .uri("/api")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+      )
+      .await
+      .unwrap();
+   let (status, value) = read_body(response).await;
+
+   assert_eq!(status, StatusCode::OK);
+   assert_eq!(
+      value["methodResponses"][0][1]["created"]["send"]["deliveryStatus"]["b@x.com"]["smtpReply"],
+      "250 2.0.0 queued",
+      "{value}"
+   );
+}
+
 /// Delayed send lifecycle without SMTP: create with a future sendAt queues
 /// a pending submission (raw bytes staged from the cache), cancel flips it
 /// to canceled, and destroy tombstones it. Stale /changes fails safely until

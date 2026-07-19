@@ -305,13 +305,13 @@ impl<'a> From<MessageBodyMetadataRowBorrowed<'a>> for MessageBodyMetadataRow {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct MessageAddressesRow {
-    pub thread_id: Option<String>,
+    pub thread_id: String,
     pub to_json: Option<String>,
     pub cc_json: Option<String>,
     pub bcc_json: Option<String>,
 }
 pub struct MessageAddressesRowBorrowed<'a> {
-    pub thread_id: Option<&'a str>,
+    pub thread_id: &'a str,
     pub to_json: Option<&'a str>,
     pub cc_json: Option<&'a str>,
     pub bcc_json: Option<&'a str>,
@@ -326,7 +326,7 @@ impl<'a> From<MessageAddressesRowBorrowed<'a>> for MessageAddressesRow {
         }: MessageAddressesRowBorrowed<'a>,
     ) -> Self {
         Self {
-            thread_id: thread_id.map(|v| v.into()),
+            thread_id: thread_id.into(),
             to_json: to_json.map(|v| v.into()),
             cc_json: cc_json.map(|v| v.into()),
             bcc_json: bcc_json.map(|v| v.into()),

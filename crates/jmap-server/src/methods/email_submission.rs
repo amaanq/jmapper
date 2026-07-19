@@ -479,10 +479,11 @@ pub fn query_changes(
 /// does not match, the create/update/destroy totals exceed the set limit, the
 /// `ifInState` guard does not match the current state, or a database access
 /// fails while reading state or applying the implicit `Email/set`.
-pub async fn set_with_implicit(
+pub(crate) async fn set_with_implicit(
    state: &AppState,
    auth: &AccountInfo,
    args: serde_json::Value,
+   created_ids: &HashMap<String, String>,
 ) -> Result<(serde_json::Value, Option<serde_json::Value>), MethodError> {
    #[derive(serde::Deserialize)]
    struct Args {
@@ -526,7 +527,7 @@ pub async fn set_with_implicit(
    let mut created_emails = HashMap::<String, (String, String)>::new();
    if let Some(create) = req.create {
       for (creation_id, payload) in create {
-         match apply_create(state, auth, account_id, &payload).await {
+         match apply_create(state, auth, account_id, &payload, created_ids).await {
             Ok((server_set, email_id)) => {
                let sub_id = server_set["id"].as_str().unwrap_or_default().to_owned();
                created_emails.insert(creation_id.clone(), (sub_id, email_id));
@@ -607,6 +608,7 @@ async fn apply_create(
    auth: &AccountInfo,
    account_id: &str,
    payload: &serde_json::Value,
+   created_ids: &HashMap<String, String>,
 ) -> Result<(serde_json::Value, String), serde_json::Value> {
    #[derive(serde::Deserialize)]
    struct CreatePayload {
@@ -639,6 +641,21 @@ async fn apply_create(
           "description": format!("invalid EmailSubmission create: {err}"),
       })
    })?;
+   let email_id = match parsed.email_id.strip_prefix('#') {
+      Some(creation_id) => {
+         created_ids
+            .get(creation_id)
+            .map(String::as_str)
+            .ok_or_else(|| {
+               serde_json::json!({
+                   "type": "invalidProperties",
+                   "properties": ["emailId"],
+                   "description": format!("unknown creation id {creation_id:?}"),
+               })
+            })?
+      },
+      None => parsed.email_id.as_str(),
+   };
    let now = chrono::Utc::now();
    // A future sendAt (or an explicit undoStatus of "pending") queues the
    // submission for the scheduler instead of relaying inline. A small skew
@@ -681,37 +698,24 @@ async fn apply_create(
       }));
    }
 
-   let row = state
-      .pool()
-      .get()
+   let client = state.pool().get().await.map_err(
+      |err| serde_json::json!({"type": "serverFail", "description": format!("db: {err}")}),
+   )?;
+   let row = queries::messages::message_addresses()
+      .bind(&client, &account_id, &email_id)
+      .opt()
       .await
       .map_err(
          |err| serde_json::json!({"type": "serverFail", "description": format!("db: {err}")}),
-      )?
-      .query_opt(
-         "SELECT thrid, to_json, cc_json, bcc_json FROM messages WHERE account_id = $1 AND msgid \
-          = $2",
-         &[&account_id, &parsed.email_id],
-      )
-      .await
-      .map_err(
-         |err| serde_json::json!({"type": "serverFail", "description": format!("db: {err}")}),
-      )?
-      .map(|row| {
-         (
-            row.get::<_, String>(0),
-            row.get::<_, Option<String>>(1),
-            row.get::<_, Option<String>>(2),
-            row.get::<_, Option<String>>(3),
-         )
-      });
-   let Some((thread_id, to_json, cc_json, bcc_json)) = row else {
+      )?;
+   let Some(row) = row else {
       return Err(serde_json::json!({
           "type": "invalidProperties",
           "properties": ["emailId"],
           "description": "emailId does not reference a cached message",
       }));
    };
+   let thread_id = row.thread_id;
 
    let (mail_from, rcpt_to) = if let Some(env) = parsed.envelope {
       (
@@ -725,7 +729,10 @@ async fn apply_create(
       // RFC 8621 §7.1: a null envelope is generated from the message —
       // identity address as the return path, To+Cc+Bcc as recipients.
       let mut rcpts = Vec::<String>::new();
-      for j in [&to_json, &cc_json, &bcc_json].into_iter().flatten() {
+      for j in [&row.to_json, &row.cc_json, &row.bcc_json]
+         .into_iter()
+         .flatten()
+      {
          let addrs = serde_json::from_str::<Vec<EmailAddress>>(j).unwrap_or_default();
          rcpts.extend(addrs.into_iter().map(|addr| addr.email));
       }
@@ -746,10 +753,10 @@ async fn apply_create(
    // otherwise read at send time.
    let mut smtp_reply = None::<String>;
    let staged_raw = if let Some(at) = delayed_until {
-      let raw = fetch_raw_for_staging(state, account_id, &parsed.email_id).await?;
+      let raw = fetch_raw_for_staging(state, account_id, email_id).await?;
       tracing::info!(
           account_id,
-          email_id = %parsed.email_id,
+          email_id,
           send_at = %at,
           bytes = raw.len(),
           "queued delayed submission",
@@ -764,7 +771,7 @@ async fn apply_create(
       })?;
       let (respond, rx) = oneshot::channel();
       tx.send(AccountRequest::SubmitEmail {
-            msgid: parsed.email_id.clone(),
+            msgid: email_id.to_owned(),
             mail_from: mail_from.clone(),
             rcpt_to: rcpt_to.clone(),
             respond,
@@ -812,7 +819,7 @@ async fn apply_create(
       let mut hasher = Sha1::new();
       hasher.update(account_id.as_bytes());
       hasher.update(b"\0");
-      hasher.update(parsed.email_id.as_bytes());
+      hasher.update(email_id.as_bytes());
       hasher.update(b"\0");
       hasher.update(modseq.to_be_bytes());
       format!("sub-{}", hex::encode(&hasher.finalize()[..10]))
@@ -827,7 +834,7 @@ async fn apply_create(
          )?,
          &account_id,
          &sub_id.as_str(),
-         &parsed.email_id.as_str(),
+         &email_id,
          &parsed.identity_id.as_str(),
          &Some(thread_id.as_str()),
          &envelope_json.to_string().as_str(),
@@ -855,7 +862,7 @@ async fn apply_create(
        "dsnBlobIds": [],
        "mdnBlobIds": [],
    });
-   Ok((server_set, parsed.email_id))
+   Ok((server_set, email_id.to_owned()))
 }
 
 /// Build the implicit Email/set response for onSuccessUpdateEmail /

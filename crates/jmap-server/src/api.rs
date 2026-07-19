@@ -185,7 +185,14 @@ async fn dispatch(
    let call_id = call.call_id.clone();
 
    if call.name == "EmailSubmission/set" {
-      return match methods::email_submission::set_with_implicit(state, auth, call.arguments).await {
+      return match methods::email_submission::set_with_implicit(
+         state,
+         auth,
+         call.arguments,
+         created_ids,
+      )
+      .await
+      {
          Ok((sub_resp, implicit)) => {
             register_created_ids(&sub_resp, created_ids);
             let mut out = vec![Invocation::new(
