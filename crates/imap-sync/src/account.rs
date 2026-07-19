@@ -315,15 +315,11 @@ async fn run_once(
       // Scope the borrow so `wait_fut` and `stop_source` are dropped before
       // we call `idle.done()` (which takes `idle` by value).
       let (idle_result, pending_req) = {
-         let (wait_fut, stop_source) = idle.wait_with_timeout(Duration::from_mins(28));
+         let (wait_fut, _stop_source) = idle.wait_with_timeout(Duration::from_mins(28));
          tokio::pin!(wait_fut);
          tokio::select! {
              idle_result = &mut wait_fut => (idle_result.map_err(SyncError::from), None),
-             req = rx.recv() => {
-                 drop(stop_source);
-                 let drained = (&mut wait_fut).await.map_err(SyncError::from);
-                 (drained, req)
-             }
+             req = rx.recv() => (Ok(IdleResponse::ManualInterrupt), req),
          }
       };
 
