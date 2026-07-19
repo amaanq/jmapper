@@ -137,12 +137,14 @@ pub struct FolderByName {
     pub id: i64,
     pub uidvalidity: i64,
     pub uidnext: i64,
+    pub uidfirst: i64,
     pub mailbox_id: String,
 }
 pub struct FolderByNameBorrowed<'a> {
     pub id: i64,
     pub uidvalidity: i64,
     pub uidnext: i64,
+    pub uidfirst: i64,
     pub mailbox_id: &'a str,
 }
 impl<'a> From<FolderByNameBorrowed<'a>> for FolderByName {
@@ -151,6 +153,7 @@ impl<'a> From<FolderByNameBorrowed<'a>> for FolderByName {
             id,
             uidvalidity,
             uidnext,
+            uidfirst,
             mailbox_id,
         }: FolderByNameBorrowed<'a>,
     ) -> Self {
@@ -158,6 +161,7 @@ impl<'a> From<FolderByNameBorrowed<'a>> for FolderByName {
             id,
             uidvalidity,
             uidnext,
+            uidfirst,
             mailbox_id: mailbox_id.into(),
         }
     }
@@ -712,7 +716,7 @@ impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::StringSql>
 pub struct FolderByNameStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn folder_by_name() -> FolderByNameStmt {
     FolderByNameStmt(
-        "SELECT id, uidvalidity, uidnext, mailbox_id FROM folders WHERE account_id = $1 AND imap_name = $2",
+        "SELECT id, uidvalidity, uidnext, uidfirst, mailbox_id FROM folders WHERE account_id = $1 AND imap_name = $2",
         None,
     )
 }
@@ -741,7 +745,8 @@ impl FolderByNameStmt {
                         id: row.try_get(0)?,
                         uidvalidity: row.try_get(1)?,
                         uidnext: row.try_get(2)?,
-                        mailbox_id: row.try_get(3)?,
+                        uidfirst: row.try_get(3)?,
+                        mailbox_id: row.try_get(4)?,
                     })
                 },
             mapper: |it| FolderByName::from(it),

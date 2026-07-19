@@ -117,7 +117,7 @@ email = "you@gmail.com"
 display_name = "Personal"
 provider = "gmail"
 bearer_token = "REPLACE"                  # `openssl rand -hex 32`
-backfill_days = 90
+backfill_days = 0 # full history
 
 [accounts.gmail]
 app_password = "abcd efgh ijkl mnop"
@@ -174,9 +174,9 @@ the Gmail IMAP OAuth bootstrap does not refresh these separate DAV fields.
 Set `server.dav_sync_interval_seconds = 0` to disable periodic DAV refreshes
 while retaining on-demand initial sync and JMAP writes.
 
-`backfill_days` (default 90) bounds how much history the first sync of each
-folder ingests, via `UID SEARCH SINCE`. Set it to 0 to fall back to the
-most-recent-500-UIDs window.
+`backfill_days = 0` (the default) ingests the full folder history. Set a
+positive day count to bound the first sync. Switching a partially synced
+account to zero safely fills the older UID range without discarding its cache.
 
 ## Optional OAuth bootstrap (Gmail)
 

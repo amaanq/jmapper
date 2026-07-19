@@ -50,9 +50,8 @@ pub struct Account {
    pub display_name:  String,
    pub provider:      ProviderKind,
    pub bearer_token:  String,
-   /// How many days back to backfill on the first ingest of each folder
-   /// (`UID SEARCH SINCE`). 0 disables the date window and falls back to the
-   /// most-recent `INITIAL_WINDOW` UIDs.
+   /// How many days back to ingest on the first sync. Zero fetches the full
+   /// folder history.
    #[serde(default = "default_backfill_days")]
    pub backfill_days: u32,
    pub gmail:         Option<GmailAuth>,
@@ -66,7 +65,7 @@ pub struct Account {
 }
 
 const fn default_backfill_days() -> u32 {
-   90
+   0
 }
 
 const fn default_dav_sync_interval_seconds() -> u64 {
@@ -285,6 +284,7 @@ password = "imap-secret"
 
       config.validate().unwrap();
       assert_eq!(config.server.dav_sync_interval_seconds, 60);
+      assert_eq!(config.accounts[0].backfill_days, 0);
       assert_eq!(
          config.accounts[0].caldav.as_ref().unwrap().auth_parts(),
          ("basic", Some("user@example.test"), Some("dav-secret"))

@@ -1,7 +1,7 @@
 [server]
-bind = "127.0.0.1:8765"
-session_url = "http://localhost:8765"
-cors_origins = ["http://localhost:3000", "http://localhost:5173"]
+bind         = "127.0.0.1:8765"
+cors_origins = [ "http://localhost:3000", "http://localhost:5173" ]
+session_url  = "http://localhost:8765"
 # libpq-style connection string; unix socket peer auth is the intended
 # production shape (`host=/run/postgresql`), TCP works for dev.
 database_url = "host=/tmp dbname=jmapper"
@@ -9,12 +9,12 @@ database_url = "host=/tmp dbname=jmapper"
 dav_sync_interval_seconds = 60
 
 [[accounts]]
-id = "me-gmail"
-email = "you@gmail.com"
-display_name = "Personal"
-provider = "gmail"
-bearer_token = "REPLACE_ME_WITH_A_RANDOM_STRING"
-backfill_days = 90
+backfill_days = 0                                 # full history; use a positive day count to bound the first sync
+bearer_token  = "REPLACE_ME_WITH_A_RANDOM_STRING"
+display_name  = "Personal"
+email         = "you@gmail.com"
+id            = "me-gmail"
+provider      = "gmail"
 
 [accounts.gmail]
 app_password = "abcd efgh ijkl mnop"

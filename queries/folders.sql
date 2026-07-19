@@ -25,7 +25,7 @@ SELECT uidfirst, mailbox_id FROM folders
 WHERE account_id = :account_id AND imap_name = :imap_name;
 
 --! folder_by_name
-SELECT id, uidvalidity, uidnext, mailbox_id FROM folders
+SELECT id, uidvalidity, uidnext, uidfirst, mailbox_id FROM folders
 WHERE account_id = :account_id AND imap_name = :imap_name;
 
 --! set_folder_uidfirst

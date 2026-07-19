@@ -65,11 +65,7 @@ use crate::{
    },
 };
 
-/// How many most-recent UIDs to fetch on a folder when no date-based window
-/// applies.
-///
-/// The fallback for `backfill_days = 0`, for servers whose SEARCH fails, and
-/// for the incremental re-fetch reconcile does on every pass.
+/// How many recent UIDs to fetch when a bounded backfill's date search fails.
 pub const INITIAL_WINDOW: u32 = 500;
 const MAX_PREFETCH_MESSAGE_BYTES: i64 = 2 * 1024 * 1024;
 
@@ -187,6 +183,9 @@ async fn sync_folder(
       .as_ref()
       .and_then(|row| u32::try_from(row.uidnext).ok())
       .filter(|uid| *uid > 0);
+   let previous_uidfirst = stored
+      .as_ref()
+      .and_then(|row| u32::try_from(row.uidfirst).ok());
 
    let mailbox_id = stored.as_ref().map_or_else(
       || mailbox_id_for_folder(account_id, &folder.name),
@@ -217,54 +216,73 @@ async fn sync_folder(
    .await?;
 
    if exists == 0 {
+      if fresh || opts.backfill_days == 0 {
+         queries::folders::set_folder_uidfirst()
+            .bind(&db::client(pool).await?, &1_i64, &folder_id)
+            .await?;
+      }
       queries::folders::set_folder_uidnext()
          .bind(&db::client(pool).await?, &i64::from(uidnext), &folder_id)
          .await?;
       return Ok(0);
    }
 
-   // Determine the UID window. First ingest honors the configured backfill;
-   // later passes start at the server's previously reported UIDNEXT, so an
-   // IDLE wake does not re-download the latest 500 envelopes in every folder.
-   let mut low = previous_uidnext
-      .unwrap_or_else(|| uidnext.saturating_sub(INITIAL_WINDOW))
-      .max(1);
-   if fresh && opts.backfill_days > 0 {
-      let since =
-         (Utc::now() - chrono::Duration::days(i64::from(opts.backfill_days))).format("%d-%b-%Y");
-      match session.uid_search(format!("SINCE {since}")).await {
-         // Empty result: nothing in the window; skip the fetch entirely
-         // rather than pulling INITIAL_WINDOW messages older than asked.
-         Ok(uids) if uids.is_empty() => {
-            debug!(name = %folder.name, %since, "no messages since backfill horizon");
-            low = uidnext.max(1);
-         },
-         Ok(uids) => {
-            low = uids.iter().copied().min().unwrap_or(low).max(1);
-            debug!(name = %folder.name, %since, low, n = uids.len(), "backfill window from SEARCH");
-         },
-         Err(err) => {
-            warn!(name = %folder.name, error = %err, "UID SEARCH SINCE failed; using window fallback");
-         },
+   let mut ranges = Vec::<String>::new();
+   let target_uidfirst = if fresh {
+      let mut low = if opts.backfill_days == 0 {
+         1
+      } else {
+         uidnext.saturating_sub(INITIAL_WINDOW).max(1)
+      };
+      if opts.backfill_days > 0 {
+         let since =
+            (Utc::now() - chrono::Duration::days(i64::from(opts.backfill_days))).format("%d-%b-%Y");
+         match session.uid_search(format!("SINCE {since}")).await {
+            Ok(uids) if uids.is_empty() => {
+               debug!(name = %folder.name, %since, "no messages since backfill horizon");
+               low = uidnext.max(1);
+            },
+            Ok(uids) => {
+               low = uids.iter().copied().min().unwrap_or(low).max(1);
+               debug!(name = %folder.name, %since, low, n = uids.len(), "backfill window from SEARCH");
+            },
+            Err(err) => {
+               warn!(name = %folder.name, error = %err, "UID SEARCH SINCE failed; using window fallback");
+            },
+         }
       }
-   }
-   if fresh {
-      // Low-water mark records how deep the first ingest went; later passes
-      // must not raise it or we'd forget the backfilled range.
-      queries::folders::set_folder_uidfirst()
-         .bind(&db::client(pool).await?, &i64::from(low), &folder_id)
-         .await?;
-      // IMAP `n:*` always matches the highest-UID message even when
-      // n > every existing UID, so an empty backfill window needs an
-      // explicit skip rather than an empty range.
-   }
-   if low >= uidnext {
+      push_uid_range(&mut ranges, low, uidnext);
+      Some(low)
+   } else {
+      let target = if opts.backfill_days == 0 && previous_uidfirst != Some(1) {
+         let previous_uidnext = previous_uidnext.unwrap_or(uidnext);
+         if let Some(high) = older_history_end(previous_uidfirst, previous_uidnext) {
+            push_uid_range(&mut ranges, 1, high.saturating_add(1));
+         }
+         Some(1)
+      } else {
+         previous_uidfirst
+      };
+      if let Some(low) = previous_uidnext {
+         push_uid_range(&mut ranges, low, uidnext);
+      }
+      target
+   };
+
+   if ranges.is_empty() {
+      if let Some(low) = target_uidfirst
+         && previous_uidfirst != Some(low)
+      {
+         queries::folders::set_folder_uidfirst()
+            .bind(&db::client(pool).await?, &i64::from(low), &folder_id)
+            .await?;
+      }
       queries::folders::set_folder_uidnext()
          .bind(&db::client(pool).await?, &i64::from(uidnext), &folder_id)
          .await?;
       return Ok(0);
    }
-   let uid_set = format!("{low}:{}", uidnext.saturating_sub(1));
+   let uid_set = ranges.join(",");
 
    let mut count = 0_u64;
    let query = "(UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID \
@@ -317,11 +335,38 @@ async fn sync_folder(
       count += 1;
    }
 
+   if let Some(low) = target_uidfirst
+      && previous_uidfirst != Some(low)
+   {
+      queries::folders::set_folder_uidfirst()
+         .bind(&db::client(pool).await?, &i64::from(low), &folder_id)
+         .await?;
+   }
    queries::folders::set_folder_uidnext()
       .bind(&db::client(pool).await?, &i64::from(uidnext), &folder_id)
       .await?;
 
    Ok(count)
+}
+
+fn push_uid_range(ranges: &mut Vec<String>, start: u32, end_exclusive: u32) {
+   if start < end_exclusive {
+      ranges.push(format!("{start}:{}", end_exclusive - 1));
+   }
+}
+
+fn older_history_end(previous_uidfirst: Option<u32>, previous_uidnext: u32) -> Option<u32> {
+   if previous_uidfirst == Some(1) {
+      return None;
+   }
+   let high = previous_uidfirst
+      .filter(|first| *first > 1)
+      .map_or_else(
+         || previous_uidnext.saturating_sub(1),
+         |first| first.saturating_sub(1),
+      )
+      .min(previous_uidnext.saturating_sub(1));
+   (high > 0).then_some(high)
 }
 
 /// X-GM-THRID map for freshly decoded fetches, when the server supports it.
@@ -2159,10 +2204,7 @@ async fn reconcile_folder(
    folder: &ImapFolder,
    opts: SyncOptions,
 ) -> Result<u64> {
-   // sync_folder runs SELECT + UIDVALIDITY check + last-INITIAL_WINDOW fetch.
-   // Its idempotent upsert only bumps modseq when rows actually change, so
-   // calling it on every reconcile is cheap when nothing moved. Folders that
-   // appear after startup are fresh and get the full backfill window.
+   // Its idempotent upsert only bumps modseq when rows actually change.
    let mut changed = sync_folder(session, pool, account_id, folder, opts).await?;
 
    // Look up the folder's cached id (sync_folder just upserted it).
@@ -2428,6 +2470,20 @@ mod tests {
          mailbox_id_for_folder("acct", "Sent")
       );
       assert!(first.starts_with("mb_"));
+   }
+
+   #[test]
+   fn full_history_deepens_partial_checkpoint() {
+      assert_eq!(older_history_end(Some(334_919), 339_522), Some(334_918));
+      assert_eq!(older_history_end(Some(1), 339_522), None);
+      assert_eq!(older_history_end(Some(0), 7), Some(6));
+      assert_eq!(older_history_end(None, 1), None);
+
+      let mut ranges = Vec::new();
+      push_uid_range(&mut ranges, 1, 334_919);
+      push_uid_range(&mut ranges, 339_522, 339_525);
+      push_uid_range(&mut ranges, 4, 4);
+      assert_eq!(ranges, ["1:334918", "339522:339524"]);
    }
 
    #[test]
