@@ -139,6 +139,7 @@ impl Default for MailCapability {
          // (see `sort_expr` in jmap-server).
          email_query_sort_options:       vec![
             "receivedAt".into(),
+            "hasKeyword".into(),
             "sentAt".into(),
             "subject".into(),
             "size".into(),
