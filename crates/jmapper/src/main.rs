@@ -12,10 +12,6 @@ use anyhow::{
    Context as _,
    Result,
 };
-use clap::{
-   Parser,
-   Subcommand,
-};
 use dav_sync::{
    engine::SyncStats,
    service::DavHandle,
@@ -24,6 +20,7 @@ use dav_sync::{
       DavKind,
    },
 };
+use pound::Parse;
 use tokio::{
    net::TcpListener,
    signal,
@@ -41,25 +38,25 @@ mod reload;
 
 use crate::config::Config;
 
-#[derive(Parser, Debug)]
-#[command(version, about = "Rust replacement for jmap-perl")]
+/// Rust replacement for jmap-perl.
+#[derive(Parse, Debug)]
 struct Cli {
    /// Path to the TOML config file.
-   #[arg(long, short, env = "JMAPPER_CONFIG", default_value = "jmapper.toml")]
+   #[pound(long, short, env = "JMAPPER_CONFIG", default = "jmapper.toml")]
    config: PathBuf,
 
-   #[command(subcommand)]
+   #[pound(subcommand)]
    command: Option<Command>,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Parse, Debug)]
 enum Command {
    /// Run the server (default action if no subcommand given).
    Run,
    /// One-time OAuth bootstrap for an OAuth-backed Gmail account.
    Bootstrap {
       /// The account id (matches `[[accounts]].id` in config).
-      #[arg(long)]
+      #[pound(long)]
       account: String,
    },
 }

@@ -53,7 +53,7 @@ tracing            = "0.1.44"
 tracing-subscriber = { features = [ "env-filter", "json" ], version = "0.3.23" }
 
 # CLI
-clap = { features = [ "derive", "env" ], version = "4.6.2" }
+pound = "0.1.6"
 
 # Errors
 anyhow    = "1.0.103"
