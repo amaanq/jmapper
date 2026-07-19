@@ -15,6 +15,7 @@ use std::{
 
 use async_imap::{
    error::Error as ImapError,
+   imap_proto::types::Envelope,
    types::Fetch,
 };
 use chrono::{
@@ -291,12 +292,24 @@ async fn sync_folder(
    // Collect before threading: the fetch stream borrows the session, and the
    // X-GM-THRID pass needs it back for a second command.
    let mut decoded = Vec::<DecodedFetch>::new();
+   let mut skipped = Vec::<u32>::new();
    {
       let mut fetches = session.uid_fetch(&uid_set, query).await?;
       while let Some(fetch) = fetches.next().await {
          let fetch = fetch?;
-         if let Some(env) = decode_fetch(&fetch, uidvalidity) {
-            decoded.push(env);
+         match decode_fetch(&fetch, uidvalidity) {
+            FetchDecode::Complete(env) => decoded.push(*env),
+            FetchDecode::Incomplete { uid } => {
+               warn!(
+                   name = %folder.name,
+                   uid,
+                   "FETCH missing INTERNALDATE/RFC822.SIZE/ENVELOPE; deferring to next round",
+               );
+               skipped.push(uid);
+            },
+            FetchDecode::Anonymous => {
+               warn!(name = %folder.name, "FETCH response without UID; ignoring");
+            },
          }
       }
    }
@@ -319,6 +332,7 @@ async fn sync_folder(
          folder_id,
          env.uid,
          uidvalidity,
+         &mailbox_id,
       )
       .await?;
       // Merge the folder into the message's mailbox set rather than
@@ -335,7 +349,9 @@ async fn sync_folder(
       count += 1;
    }
 
-   if let Some(low) = target_uidfirst
+   let (checkpoint_uidnext, allow_uidfirst) = skip_checkpoints(&skipped, previous_uidnext, uidnext);
+   if allow_uidfirst
+      && let Some(low) = target_uidfirst
       && previous_uidfirst != Some(low)
    {
       queries::folders::set_folder_uidfirst()
@@ -343,7 +359,11 @@ async fn sync_folder(
          .await?;
    }
    queries::folders::set_folder_uidnext()
-      .bind(&db::client(pool).await?, &i64::from(uidnext), &folder_id)
+      .bind(
+         &db::client(pool).await?,
+         &i64::from(checkpoint_uidnext),
+         &folder_id,
+      )
       .await?;
 
    Ok(count)
@@ -469,47 +489,80 @@ struct DecodedFetch {
    envelope: db::MessageEnvelope,
 }
 
-fn decode_fetch(fetch: &Fetch, uidvalidity: u32) -> Option<DecodedFetch> {
-   let uid = fetch.uid?;
-   let internal_date = fetch
-      .internal_date()
-      .map_or_else(Utc::now, |date| date.with_timezone(&Utc));
-   let size = u64::from(fetch.size.unwrap_or(0));
+struct FetchParts<'a> {
+   uid:           Option<u32>,
+   internal_date: Option<DateTime<Utc>>,
+   size:          Option<u32>,
+   envelope:      Option<&'a Envelope<'a>>,
+   header:        Option<&'a [u8]>,
+   flags:         Vec<String>,
+}
 
-   let (from, to, cc, bcc, reply_to, sender_date, subject, msgid_header, irt_header) =
-      fetch.envelope().map_or(
-         (None, None, None, None, None, None, None, None, None),
-         |envelope| {
-            (
-               addresses(envelope.from.as_deref()),
-               addresses(envelope.to.as_deref()),
-               addresses(envelope.cc.as_deref()),
-               addresses(envelope.bcc.as_deref()),
-               addresses(envelope.reply_to.as_deref()),
-               parse_imap_date(envelope.date.as_deref()),
-               envelope.subject.as_deref().and_then(decode_envelope_text),
-               envelope
-                  .message_id
-                  .as_deref()
-                  .and_then(|bytes| from_utf8(bytes).ok().map(str::to_owned)),
-               envelope
-                  .in_reply_to
-                  .as_deref()
-                  .and_then(|bytes| from_utf8(bytes).ok().map(str::to_owned)),
-            )
-         },
-      );
+enum FetchDecode {
+   Complete(Box<DecodedFetch>),
+   /// Invented timestamps would change fallback msgids on each retry.
+   Incomplete {
+      uid: u32,
+   },
+   Anonymous,
+}
 
-   let msgid = normalized_msgid(msgid_header.as_deref(), uidvalidity, uid, internal_date);
-
+fn decode_fetch(fetch: &Fetch, uidvalidity: u32) -> FetchDecode {
    let flags = fetch
       .flags()
       .map(|flag| format_flag(&flag))
       .collect::<Vec<String>>();
+   decode_parts(
+      FetchParts {
+         uid: fetch.uid,
+         internal_date: fetch.internal_date().map(|date| date.with_timezone(&Utc)),
+         size: fetch.size,
+         envelope: fetch.envelope(),
+         header: fetch.header(),
+         flags,
+      },
+      uidvalidity,
+   )
+}
+
+fn decode_parts(parts: FetchParts<'_>, uidvalidity: u32) -> FetchDecode {
+   let FetchParts {
+      uid,
+      internal_date,
+      size,
+      envelope,
+      header,
+      flags,
+   } = parts;
+   let Some(uid) = uid else {
+      return FetchDecode::Anonymous;
+   };
+   let (Some(internal_date), Some(size), Some(envelope)) = (internal_date, size, envelope) else {
+      return FetchDecode::Incomplete { uid };
+   };
+   let size = u64::from(size);
+
+   let from = addresses(envelope.from.as_deref());
+   let to = addresses(envelope.to.as_deref());
+   let cc = addresses(envelope.cc.as_deref());
+   let bcc = addresses(envelope.bcc.as_deref());
+   let reply_to = addresses(envelope.reply_to.as_deref());
+   let sender_date = parse_imap_date(envelope.date.as_deref());
+   let subject = envelope.subject.as_deref().and_then(decode_envelope_text);
+   let msgid_header = envelope
+      .message_id
+      .as_deref()
+      .and_then(|bytes| from_utf8(bytes).ok().map(str::to_owned));
+   let irt_header = envelope
+      .in_reply_to
+      .as_deref()
+      .and_then(|bytes| from_utf8(bytes).ok().map(str::to_owned));
+
+   let msgid = normalized_msgid(msgid_header.as_deref(), uidvalidity, uid, internal_date);
 
    let has_attachment = false; // determined later when we parse full body
 
-   let header_bytes = fetch.header().unwrap_or(&[]);
+   let header_bytes = header.unwrap_or(&[]);
    let parsed_headers = mail_parser::MessageParser::default().parse_headers(header_bytes);
    let references_header = parsed_headers
       .as_ref()
@@ -519,7 +572,7 @@ fn decode_fetch(fetch: &Fetch, uidvalidity: u32) -> Option<DecodedFetch> {
       .and_then(|message| joined_message_ids(message.in_reply_to()))
       .or(irt_header);
 
-   Some(DecodedFetch {
+   FetchDecode::Complete(Box::new(DecodedFetch {
       uid,
       envelope: db::MessageEnvelope {
          msgid: msgid.clone(),
@@ -540,7 +593,22 @@ fn decode_fetch(fetch: &Fetch, uidvalidity: u32) -> Option<DecodedFetch> {
          in_reply_to_header: in_reply_to_header.map(|header| unangle_brackets(&header)),
          references_header,
       },
-   })
+   }))
+}
+
+/// Keep checkpoints behind skipped UIDs so later syncs retry them.
+fn skip_checkpoints(
+   skipped: &[u32],
+   previous_uidnext: Option<u32>,
+   server_uidnext: u32,
+) -> (u32, bool) {
+   let boundary = previous_uidnext.unwrap_or(0);
+   let delta_clamp = skipped.iter().copied().filter(|uid| *uid >= boundary).min();
+   let history_clean = !skipped.iter().any(|uid| *uid < boundary);
+   (
+      delta_clamp.map_or(server_uidnext, |low| low.min(server_uidnext)),
+      history_clean,
+   )
 }
 
 fn joined_message_ids(value: &mail_parser::HeaderValue<'_>) -> Option<String> {
@@ -2221,11 +2289,13 @@ async fn reconcile_folder(
    };
    let folder_id = cached_folder.id;
 
-   // Cached UIDs for this folder.
    let cached_uids = queries::messages::uids_in_folder()
       .bind(&db::client(pool).await?, &account_id, &folder_id)
       .all()
-      .await?;
+      .await?
+      .into_iter()
+      .map(|uid| uid as u32)
+      .collect::<BTreeSet<u32>>();
 
    if cached_uids.is_empty() {
       return Ok(changed);
@@ -2240,79 +2310,63 @@ async fn reconcile_folder(
       .collect::<HashSet<u32>>();
 
    // Any cached UID not in the server set has been expunged.
-   let mut expunged = Vec::<u32>::new();
-   for cached_uid in &cached_uids {
-      if !server_uids.contains(&(*cached_uid as u32)) {
-         expunged.push(*cached_uid as u32);
-      }
-   }
+   let expunged = cached_uids
+      .into_iter()
+      .filter(|uid| !server_uids.contains(uid))
+      .collect::<BTreeSet<u32>>();
 
-   if !expunged.is_empty() {
-      let mut conn = db::client(pool).await?;
-      let tx = conn.transaction().await?;
-      for uid in &expunged {
-         // Find the msgid for this (folder, uid) so we can check whether
-         // dropping it leaves an orphaned message.
-         let msgid = queries::messages::msgid_for_folder_uid()
-            .bind(&tx, &account_id, &folder_id, &i64::from(*uid))
-            .opt()
-            .await?;
-         let Some(msgid) = msgid else { continue };
-
-         queries::messages::delete_message_imap_by_uid()
-            .bind(&tx, &account_id, &folder_id, &i64::from(*uid))
-            .await?;
-
-         let still_elsewhere = queries::messages::count_message_imap()
-            .bind(&tx, &account_id, &msgid.as_str())
-            .one()
-            .await?;
-
-         if still_elsewhere == 0 {
-            // Message now belongs to no folder — bump email modseq and
-            // delete. CASCADE drops message_mailboxes + raw_messages.
-            queries::state::bump_email_modseq()
-               .bind(&tx, &account_id)
-               .one()
-               .await?;
-            queries::messages::delete_message()
-               .bind(&tx, &account_id, &msgid.as_str())
-               .await?;
-         } else {
-            // Still visible in another folder; just the membership in this
-            // mailbox is gone. Remove the mailbox mapping and stamp the
-            // message row's modseq so Email/changes reports the
-            // mailboxIds shrink — a global state bump alone would leave
-            // the messages.modseq behind and hide the update from
-            // clients paging sinceState.
-            queries::messages::remove_message_mailbox()
-               .bind(
-                  &tx,
-                  &account_id,
-                  &msgid.as_str(),
-                  &cached_folder.mailbox_id.as_str(),
-               )
-               .await?;
-            let new_modseq = queries::state::bump_email_modseq()
-               .bind(&tx, &account_id)
-               .one()
-               .await?;
-            queries::messages::set_message_modseq()
-               .bind(&tx, &new_modseq, &account_id, &msgid.as_str())
-               .await?;
-         }
-         changed += 1;
-      }
-      tx.commit().await?;
-
+   let reconciled = apply_expunges(
+      pool,
+      account_id,
+      folder_id,
+      &cached_folder.mailbox_id,
+      &expunged,
+   )
+   .await?;
+   if reconciled > 0 {
       debug!(
           account_id,
           folder = %folder.name,
-          expunged = expunged.len(),
+          expunged = reconciled,
           "reconciled expunges",
       );
    }
+   changed += reconciled;
 
+   Ok(changed)
+}
+
+/// Clear every cached occupant of each expunged UID slot.
+async fn apply_expunges(
+   pool: &PgPool,
+   account_id: &str,
+   folder_id: i64,
+   mailbox_id: &str,
+   expunged: &BTreeSet<u32>,
+) -> Result<u64> {
+   if expunged.is_empty() {
+      return Ok(0);
+   }
+   let mut changed = 0_u64;
+   let mut conn = db::client(pool).await?;
+   let tx = conn.transaction().await?;
+   for uid in expunged {
+      let msgids = queries::messages::msgid_for_folder_uid()
+         .bind(&tx, &account_id, &folder_id, &i64::from(*uid))
+         .all()
+         .await?;
+      if msgids.is_empty() {
+         continue;
+      }
+      queries::messages::delete_message_imap_by_uid()
+         .bind(&tx, &account_id, &folder_id, &i64::from(*uid))
+         .await?;
+      for msgid in &msgids {
+         db::remove_folder_placement(&tx, account_id, msgid, mailbox_id).await?;
+      }
+      changed += 1;
+   }
+   tx.commit().await?;
    Ok(changed)
 }
 
@@ -2404,12 +2458,29 @@ pub async fn delta_sync(
 
    let mut count = 0_u64;
    let mut decoded = Vec::<DecodedFetch>::new();
+   let mut skipped = Vec::<u32>::new();
    {
       let mut fetches = session.uid_fetch(&uid_set, query).await?;
       while let Some(fetch) = fetches.next().await {
          let fetch = fetch?;
-         if let Some(env) = decode_fetch(&fetch, uidvalidity) {
-            decoded.push(env);
+         match decode_fetch(&fetch, uidvalidity) {
+            FetchDecode::Complete(env) => decoded.push(*env),
+            FetchDecode::Incomplete { uid } => {
+               warn!(
+                  account_id,
+                  folder = folder_name,
+                  uid,
+                  "FETCH missing INTERNALDATE/RFC822.SIZE/ENVELOPE; deferring to next round",
+               );
+               skipped.push(uid);
+            },
+            FetchDecode::Anonymous => {
+               warn!(
+                  account_id,
+                  folder = folder_name,
+                  "FETCH response without UID; ignoring"
+               );
+            },
          }
       }
    }
@@ -2430,6 +2501,7 @@ pub async fn delta_sync(
          folder_id,
          env.uid,
          uidvalidity,
+         &mailbox_id,
       )
       .await?;
       queries::messages::add_message_mailbox()
@@ -2443,8 +2515,13 @@ pub async fn delta_sync(
       count += 1;
    }
 
+   let (checkpoint_uidnext, _) = skip_checkpoints(&skipped, Some(low), uidnext);
    queries::folders::set_folder_uidnext()
-      .bind(&db::client(pool).await?, &i64::from(uidnext), &folder_id)
+      .bind(
+         &db::client(pool).await?,
+         &i64::from(checkpoint_uidnext),
+         &folder_id,
+      )
       .await?;
 
    if count > 0 {
@@ -2501,6 +2578,64 @@ mod tests {
       assert!(!is_valid_folder_name("wild%card"));
       assert!(!is_valid_folder_name("quo\"te"));
       assert!(!is_valid_folder_name(&"x".repeat(300)));
+   }
+
+   fn empty_envelope() -> Envelope<'static> {
+      Envelope {
+         date:        None,
+         subject:     None,
+         from:        None,
+         sender:      None,
+         reply_to:    None,
+         to:          None,
+         cc:          None,
+         bcc:         None,
+         in_reply_to: None,
+         message_id:  None,
+      }
+   }
+
+   #[test]
+   fn fetch_requires_uid_date_size_and_envelope() {
+      let ts = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+      let envelope = empty_envelope();
+      let parts = |uid, internal_date, size, envelope| {
+         FetchParts {
+            uid,
+            internal_date,
+            size,
+            envelope,
+            header: None,
+            flags: vec![],
+         }
+      };
+      assert!(matches!(
+         decode_parts(parts(Some(9), Some(ts), Some(1), Some(&envelope)), 1),
+         FetchDecode::Complete(_)
+      ));
+      for incomplete in [
+         parts(Some(9), None, Some(1), Some(&envelope)),
+         parts(Some(9), Some(ts), None, Some(&envelope)),
+         parts(Some(9), Some(ts), Some(1), None),
+      ] {
+         assert!(matches!(
+            decode_parts(incomplete, 1),
+            FetchDecode::Incomplete { uid: 9 }
+         ));
+      }
+      assert!(matches!(
+         decode_parts(parts(None, Some(ts), Some(1), Some(&envelope)), 1),
+         FetchDecode::Anonymous
+      ));
+   }
+
+   #[test]
+   fn skipped_uids_hold_back_sync_checkpoints() {
+      assert_eq!(skip_checkpoints(&[], Some(100), 200), (200, true));
+      assert_eq!(skip_checkpoints(&[150, 180], Some(100), 200), (150, true));
+      assert_eq!(skip_checkpoints(&[50], Some(100), 200), (200, false));
+      assert_eq!(skip_checkpoints(&[50, 150], Some(100), 200), (150, false));
+      assert_eq!(skip_checkpoints(&[5], None, 200), (5, true));
    }
 
    #[test]

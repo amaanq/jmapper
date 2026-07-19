@@ -680,7 +680,8 @@ pub async fn set_message_mailboxes(
    Ok(())
 }
 
-#[inline]
+/// Upsert a folder placement, evicting any occupant of the UID slot.
+///
 /// # Errors
 ///
 /// Returns an error when the database operation fails.
@@ -691,11 +692,29 @@ pub async fn upsert_message_imap(
    folder_id: i64,
    uid: u32,
    uidvalidity: u32,
+   mailbox_id: &str,
 ) -> Result<()> {
-   let client = client(pool).await?;
+   let mut conn = client(pool).await?;
+   let tx = conn.transaction().await?;
+   let occupants = queries::messages::msgid_for_folder_uid()
+      .bind(&tx, &account_id, &folder_id, &i64::from(uid))
+      .all()
+      .await?;
+   let stale = occupants
+      .into_iter()
+      .filter(|occupant| occupant != msgid)
+      .collect::<Vec<String>>();
+   if !stale.is_empty() {
+      queries::messages::delete_message_imap_by_uid()
+         .bind(&tx, &account_id, &folder_id, &i64::from(uid))
+         .await?;
+      for old_msgid in &stale {
+         remove_folder_placement(&tx, account_id, old_msgid, mailbox_id).await?;
+      }
+   }
    queries::messages::upsert_message_imap()
       .bind(
-         &client,
+         &tx,
          &account_id,
          &msgid,
          &folder_id,
@@ -703,6 +722,47 @@ pub async fn upsert_message_imap(
          &i64::from(uidvalidity),
       )
       .await?;
+   tx.commit().await?;
+   Ok(())
+}
+
+/// Clean up after removing a message's folder placement.
+///
+/// # Errors
+///
+/// Returns an error when the database operation fails.
+pub(crate) async fn remove_folder_placement(
+   tx: &deadpool_postgres::Transaction<'_>,
+   account_id: &str,
+   msgid: &str,
+   mailbox_id: &str,
+) -> Result<()> {
+   let still_elsewhere = queries::messages::count_message_imap()
+      .bind(tx, &account_id, &msgid)
+      .one()
+      .await?;
+   if still_elsewhere == 0 {
+      // CASCADE clears mailbox and raw-message rows.
+      queries::state::bump_email_modseq()
+         .bind(tx, &account_id)
+         .one()
+         .await?;
+      queries::messages::delete_message()
+         .bind(tx, &account_id, &msgid)
+         .await?;
+   } else {
+      // Advance the row modseq so Email/changes exposes the mailbox removal.
+      queries::messages::remove_message_mailbox()
+         .bind(tx, &account_id, &msgid, &mailbox_id)
+         .await?;
+      let new_modseq = queries::state::bump_email_modseq()
+         .bind(tx, &account_id)
+         .one()
+         .await?;
+      queries::messages::set_message_modseq()
+         .bind(tx, &new_modseq, &account_id, &msgid)
+         .await?;
+   }
    Ok(())
 }
 

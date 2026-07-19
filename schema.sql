@@ -2,6 +2,12 @@
 -- seconds (not timestamptz): every reader converts through chrono at the
 -- edges already, and the sync loop compares raw IMAP INTERNALDATE seconds.
 
+-- The migration runner creates this before loading the baseline.
+CREATE TABLE IF NOT EXISTS schema_version (
+    version    BIGINT NOT NULL PRIMARY KEY,
+    applied_at BIGINT NOT NULL
+);
+
 CREATE TABLE accounts (
     id                TEXT   PRIMARY KEY,
     email             TEXT   NOT NULL,

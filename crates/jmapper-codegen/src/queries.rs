@@ -6,6 +6,7 @@ pub mod dav;
 pub mod folders;
 pub mod mailboxes;
 pub mod messages;
+pub mod migrations;
 pub mod oauth;
 pub mod raw_messages;
 pub mod state;

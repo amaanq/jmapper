@@ -40,6 +40,32 @@ pub async fn test_pool() -> Option<Pool> {
 }
 
 async fn fresh_db(admin_url: &str) -> Result<Pool> {
+   let url = create_empty_db(admin_url).await?;
+   cache::open(&url).await
+}
+
+/// Create an unmigrated database for migration tests.
+///
+/// # Panics
+///
+/// Panics under the same conditions as [`test_pool`].
+pub async fn raw_test_db() -> Option<String> {
+   let Ok(admin_url) = env::var("JMAPPER_TEST_DB_URL") else {
+      assert!(
+         env::var("JMAPPER_REQUIRE_DB_TESTS").is_err(),
+         "JMAPPER_REQUIRE_DB_TESTS is set but JMAPPER_TEST_DB_URL is missing"
+      );
+      eprintln!("skipping DB-backed test: JMAPPER_TEST_DB_URL not set");
+      return None;
+   };
+   Some(
+      create_empty_db(&admin_url)
+         .await
+         .expect("test database setup failed"),
+   )
+}
+
+async fn create_empty_db(admin_url: &str) -> Result<String> {
    let name = format!(
       "jmapper_test_{}_{}",
       process::id(),
@@ -52,7 +78,7 @@ async fn fresh_db(admin_url: &str) -> Result<Pool> {
       .await?;
    drop(client);
    conn_task.abort();
-   cache::open(&rewrite_dbname(admin_url, &name)).await
+   Ok(rewrite_dbname(admin_url, &name))
 }
 
 fn rewrite_dbname(url: &str, name: &str) -> String {

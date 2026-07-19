@@ -846,7 +846,11 @@ fn email_sort_terms(comparators: Option<&[Comparator]>) -> Result<Vec<SortTerm>,
          if comparator.collation.is_some() {
             return Err(MethodError::UnsupportedSort);
          }
-         let direction = if comparator.is_ascending { "ASC" } else { "DESC" };
+         let direction = if comparator.is_ascending {
+            "ASC"
+         } else {
+            "DESC"
+         };
          // hasKeyword (RFC 8621 §4.4.2) carries the keyword as a comparator
          // argument; the expression mirrors the hasKeyword filter's substring
          // probe of the JSON flag array. Boolean sort, so DESC puts emails
@@ -1310,7 +1314,10 @@ mod filter_tests {
       let terms = email_sort_terms(Some(&comparators)).unwrap();
 
       assert_eq!(terms.len(), 2);
-      assert_eq!(terms[0].expression, r#"(strpos(m.flags_json, '"$pinned"') > 0)"#);
+      assert_eq!(
+         terms[0].expression,
+         r#"(strpos(m.flags_json, '"$pinned"') > 0)"#
+      );
       assert_eq!(terms[0].direction, "DESC");
       assert_eq!(terms[1].expression, "m.received_at");
    }
