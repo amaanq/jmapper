@@ -815,14 +815,18 @@ pub async fn prefetch_recent_bodies(
    session: &mut ImapSession,
    pool: &PgPool,
    account_id: &str,
+   window: usize,
    limit: usize,
 ) -> Result<usize> {
+   let window = i64::try_from(window)
+      .map_err(|_| SyncError::Other("body cache window exceeds i64".into()))?;
    let limit = i64::try_from(limit)
       .map_err(|_| SyncError::Other("body prefetch limit exceeds i64".into()))?;
    let msgids = queries::raw_messages::recent_uncached_message_ids()
       .bind(
          &db::client(pool).await?,
          &account_id,
+         &window,
          &MAX_PREFETCH_MESSAGE_BYTES,
          &limit,
       )

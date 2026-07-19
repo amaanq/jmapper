@@ -17,12 +17,18 @@ SELECT msgid FROM raw_messages
 WHERE account_id = :account_id AND msgid = ANY(:msgids);
 
 --! recent_uncached_message_ids
+WITH recent AS (
+  SELECT account_id, msgid, received_at, size
+  FROM messages
+  WHERE account_id = :account_id
+  ORDER BY received_at DESC
+  LIMIT :window
+)
 SELECT m.msgid
-FROM messages m
+FROM recent m
 LEFT JOIN raw_messages r
   ON r.account_id = m.account_id AND r.msgid = m.msgid
-WHERE m.account_id = :account_id
-  AND r.msgid IS NULL
+WHERE r.msgid IS NULL
   AND m.size <= :max_bytes
 ORDER BY m.received_at DESC
 LIMIT :limit;

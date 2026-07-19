@@ -53,7 +53,8 @@ use crate::{
 /// Account-task failures that triggered a reconnect.
 pub static SYNC_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 const REQUEST_QUEUE_CAPACITY: usize = 128;
-const STARTUP_BODY_PREFETCH: usize = 64;
+const BODY_CACHE_WINDOW: usize = 2_048;
+const BODY_CACHE_BATCH: usize = 32;
 const INCREMENTAL_BODY_PREFETCH: usize = 16;
 
 #[derive(Debug, Clone)]
@@ -210,6 +211,20 @@ pub struct AccountHandle {
    pub task: JoinHandle<()>,
 }
 
+struct BodyCacheWarmer(JoinHandle<()>);
+
+impl BodyCacheWarmer {
+   fn spawn(runtime: AccountRuntime, pool: PgPool) -> Self {
+      Self(tokio::spawn(warm_body_cache(runtime, pool)))
+   }
+}
+
+impl Drop for BodyCacheWarmer {
+   fn drop(&mut self) {
+      self.0.abort();
+   }
+}
+
 #[must_use]
 #[inline]
 pub fn spawn(runtime: AccountRuntime, pool: PgPool) -> AccountHandle {
@@ -289,16 +304,7 @@ async fn run_once(
    if repaired > 0 {
       info!(account_id = %runtime.id, repaired, "repaired cached body metadata");
    }
-   match sync::prefetch_recent_bodies(&mut session, pool, &runtime.id, STARTUP_BODY_PREFETCH).await
-   {
-      Ok(prefetched) if prefetched > 0 => {
-         info!(account_id = %runtime.id, prefetched, "prefetched recent message bodies");
-      },
-      Ok(_) => {},
-      Err(err) => {
-         warn!(account_id = %runtime.id, error = %err, "recent body prefetch failed; continuing");
-      },
-   }
+   let _body_cache_warmer = BodyCacheWarmer::spawn(runtime.clone(), pool.clone());
 
    let primary = discover_primary_folder(&mut session, runtime.provider).await?;
    info!(account_id = %runtime.id, folder = %primary, "entering IDLE");
@@ -352,6 +358,7 @@ async fn run_once(
                   &mut session,
                   pool,
                   &runtime.id,
+                  BODY_CACHE_WINDOW,
                   INCREMENTAL_BODY_PREFETCH,
                )
                .await
@@ -411,6 +418,58 @@ async fn run_once(
          info!(account_id = %runtime.id, "request channel closed; exiting");
          return Ok(());
       }
+   }
+}
+
+async fn warm_body_cache(runtime: AccountRuntime, pool: PgPool) {
+   let mut backoff = Duration::from_secs(2);
+   let mut warmed = 0_usize;
+
+   loop {
+      let mut session = match connect_and_auth(&runtime, &pool).await {
+         Ok(session) => session,
+         Err(error) => {
+            warn!(
+               account_id = %runtime.id,
+               %error,
+               "body cache connection failed; retrying",
+            );
+            time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(300));
+            continue;
+         },
+      };
+      backoff = Duration::from_secs(2);
+
+      loop {
+         match sync::prefetch_recent_bodies(
+            &mut session,
+            &pool,
+            &runtime.id,
+            BODY_CACHE_WINDOW,
+            BODY_CACHE_BATCH,
+         )
+         .await
+         {
+            Ok(0) => {
+               info!(account_id = %runtime.id, warmed, "recent body cache ready");
+               return;
+            },
+            Ok(count) => warmed += count,
+            Err(error) => {
+               warn!(
+                  account_id = %runtime.id,
+                  %error,
+                  "body cache fill interrupted; reconnecting",
+               );
+               break;
+            },
+         }
+         time::sleep(Duration::from_millis(250)).await;
+      }
+
+      time::sleep(backoff).await;
+      backoff = (backoff * 2).min(Duration::from_secs(300));
    }
 }
 
