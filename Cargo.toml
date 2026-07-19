@@ -1,11 +1,11 @@
 [workspace]
 exclude = [ "crates/jmapper-codegen" ]
 members = [
-	"crates/jmap-protocol",
-	"crates/imap-sync",
-	"crates/jmap-server",
-	"crates/jmapper",
-	"crates/dav-sync",
+  "crates/jmap-protocol",
+  "crates/imap-sync",
+  "crates/jmap-server",
+  "crates/jmapper",
+  "crates/dav-sync",
 ]
 resolver = "2"
 
@@ -75,26 +75,26 @@ sha1 = "0.11.0"
 sha2 = "0.11.0"
 subtle = "2.6.1"
 tokio = {
-	features = [
-		"rt-multi-thread",
-		"macros",
-		"net",
-		"sync",
-		"time",
-		"signal",
-		"fs",
-		"io-util",
-	],
-	version = "1.53.0",
+  features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "sync",
+    "time",
+    "signal",
+    "fs",
+    "io-util",
+  ],
+  version = "1.53.0",
 }
 tokio-rustls = {
-	default-features = false,
-	features = [
-		"ring",
-		"logging",
-		"tls12",
-	],
-	version = "0.26.4",
+  default-features = false,
+  features = [
+    "ring",
+    "logging",
+    "tls12",
+  ],
+  version = "0.26.4",
 }
 tokio-stream = { features = [ "sync" ], version = "0.1.18" }
 url = "2.5.8"

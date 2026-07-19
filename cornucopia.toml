@@ -1,6 +1,6 @@
 destination = "crates/jmapper-codegen"
 
 [manifest.package]
-name = "jmapper-codegen"
+name    = "jmapper-codegen"
 license = "MIT OR Apache-2.0"
 publish = false
