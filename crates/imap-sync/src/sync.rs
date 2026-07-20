@@ -85,9 +85,12 @@ pub struct SyncStats {
 /// Per-pass knobs threaded from the account task into every folder sync.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SyncOptions {
-   pub backfill_days: u32,
+   pub backfill_days:  u32,
    /// Server advertises X-GM-EXT-1: prefer X-GM-THRID for threading.
-   pub gmail_thrid:   bool,
+   pub gmail_thrid:    bool,
+   /// Interactive requests (move, destroy, import) reconcile with this off
+   /// so a huge folder cannot turn one delete into a full-history fetch.
+   pub deepen_history: bool,
 }
 
 async fn sync_options(session: &mut ImapSession, backfill_days: u32) -> SyncOptions {
@@ -97,6 +100,25 @@ async fn sync_options(session: &mut ImapSession, backfill_days: u32) -> SyncOpti
    SyncOptions {
       backfill_days,
       gmail_thrid,
+      deepen_history: true,
+   }
+}
+
+async fn interactive_options(session: &mut ImapSession) -> SyncOptions {
+   let mut opts = sync_options(session, 0).await;
+   opts.deepen_history = false;
+   opts
+}
+
+fn wants_history_deepening(opts: SyncOptions, previous_uidfirst: Option<u32>) -> bool {
+   opts.deepen_history && opts.backfill_days == 0 && previous_uidfirst != Some(1)
+}
+
+fn fresh_backfill_low(opts: SyncOptions, uidnext: u32) -> u32 {
+   if opts.backfill_days == 0 && opts.deepen_history {
+      1
+   } else {
+      uidnext.saturating_sub(INITIAL_WINDOW).max(1)
    }
 }
 
@@ -230,11 +252,7 @@ async fn sync_folder(
 
    let mut ranges = Vec::<String>::new();
    let target_uidfirst = if fresh {
-      let mut low = if opts.backfill_days == 0 {
-         1
-      } else {
-         uidnext.saturating_sub(INITIAL_WINDOW).max(1)
-      };
+      let mut low = fresh_backfill_low(opts, uidnext);
       if opts.backfill_days > 0 {
          let since =
             (Utc::now() - chrono::Duration::days(i64::from(opts.backfill_days))).format("%d-%b-%Y");
@@ -255,7 +273,7 @@ async fn sync_folder(
       push_uid_range(&mut ranges, low, uidnext);
       Some(low)
    } else {
-      let target = if opts.backfill_days == 0 && previous_uidfirst != Some(1) {
+      let target = if wants_history_deepening(opts, previous_uidfirst) {
          let previous_uidnext = previous_uidnext.unwrap_or(uidnext);
          if let Some(high) = older_history_end(previous_uidfirst, previous_uidnext) {
             push_uid_range(&mut ranges, 1, high.saturating_add(1));
@@ -1473,7 +1491,9 @@ pub async fn mutate_mailboxes(
       }
    }
 
-   // Reconcile the touched folders so the DB membership catches up.
+   // Reconcile the touched folders so the DB membership catches up. Real
+   // LIST entries, a synthesized folder without its role would clobber the
+   // mailbox's role and sort order.
    let mut touched = add_folders
       .iter()
       .chain(remove_folders.iter())
@@ -1481,18 +1501,13 @@ pub async fn mutate_mailboxes(
       .collect::<Vec<String>>();
    touched.sort();
    touched.dedup();
+   let opts = interactive_options(session).await;
+   let listed = imap::list_folders(session).await?;
    for name in touched {
-      let folder = ImapFolder {
-         name:      name.clone(),
-         delimiter: '/',
-         flags:     vec![],
-         role:      None,
+      let Some(folder) = listed.iter().find(|folder| folder.name == name) else {
+         continue;
       };
-      let _ = reconcile_folder(session, pool, account_id, &folder, SyncOptions {
-         backfill_days: 0,
-         gmail_thrid:   false,
-      })
-      .await?;
+      let _ = reconcile_folder(session, pool, account_id, folder, opts).await?;
    }
 
    db::recompute_mailbox_counts(pool, account_id).await?;
@@ -1616,11 +1631,8 @@ pub async fn create_folder(
             "created {imap_name:?} but the server does not list it"
          ))
       })?;
-   sync_folder(session, pool, account_id, folder, SyncOptions {
-      backfill_days: 0,
-      gmail_thrid:   false,
-   })
-   .await?;
+   let opts = interactive_options(session).await;
+   sync_folder(session, pool, account_id, folder, opts).await?;
 
    let folder = queries::folders::folder_by_name()
       .bind(&db::client(pool).await?, &account_id, &imap_name.as_str())
@@ -1915,11 +1927,8 @@ pub async fn import_message(
             "folder {folder_name_only} disappeared after APPEND"
          ))
       })?;
-   let _ = reconcile_folder(session, pool, account_id, &folder, SyncOptions {
-      backfill_days: 0,
-      gmail_thrid:   false,
-   })
-   .await?;
+   let opts = interactive_options(session).await;
+   let _ = reconcile_folder(session, pool, account_id, &folder, opts).await?;
 
    // 6. Locate the appended message via its (now guaranteed-unique) Message-ID
    //    header. SELECTing the folder fresh and probing the message_id_header
@@ -2636,6 +2645,27 @@ mod tests {
       assert_eq!(skip_checkpoints(&[50], Some(100), 200), (200, false));
       assert_eq!(skip_checkpoints(&[50, 150], Some(100), 200), (150, false));
       assert_eq!(skip_checkpoints(&[5], None, 200), (5, true));
+   }
+
+   #[test]
+   fn interactive_reconcile_never_touches_history() {
+      let periodic = SyncOptions {
+         backfill_days:  0,
+         gmail_thrid:    false,
+         deepen_history: true,
+      };
+      let interactive = SyncOptions {
+         deepen_history: false,
+         ..periodic
+      };
+      assert!(wants_history_deepening(periodic, Some(250_865)));
+      assert!(!wants_history_deepening(interactive, Some(250_865)));
+      assert!(!wants_history_deepening(periodic, Some(1)));
+      assert_eq!(fresh_backfill_low(periodic, 340_000), 1);
+      assert_eq!(
+         fresh_backfill_low(interactive, 340_000),
+         340_000 - INITIAL_WINDOW
+      );
    }
 
    #[test]
