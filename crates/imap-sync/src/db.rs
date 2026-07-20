@@ -726,6 +726,42 @@ pub async fn upsert_message_imap(
    Ok(())
 }
 
+/// Apply a mailbox-membership delta with a fresh modseq, without touching
+/// `message_imap`, so the IMAP work can run after the client is answered.
+///
+/// # Errors
+///
+/// Returns an error when the database operation fails.
+pub async fn apply_membership_delta(
+   pool: &Pool,
+   account_id: &str,
+   msgid: &str,
+   add: &[String],
+   remove: &[String],
+) -> Result<()> {
+   let mut conn = client(pool).await?;
+   let tx = conn.transaction().await?;
+   for mailbox_id in add {
+      queries::messages::add_message_mailbox()
+         .bind(&tx, &account_id, &msgid, &mailbox_id.as_str())
+         .await?;
+   }
+   for mailbox_id in remove {
+      queries::messages::remove_message_mailbox()
+         .bind(&tx, &account_id, &msgid, &mailbox_id.as_str())
+         .await?;
+   }
+   let new_modseq = queries::state::bump_email_modseq()
+      .bind(&tx, &account_id)
+      .one()
+      .await?;
+   queries::messages::set_message_modseq()
+      .bind(&tx, &new_modseq, &account_id, &msgid)
+      .await?;
+   tx.commit().await?;
+   Ok(())
+}
+
 /// Clean up after removing a message's folder placement.
 ///
 /// # Errors

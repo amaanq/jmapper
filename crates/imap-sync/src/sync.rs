@@ -1314,7 +1314,7 @@ pub async fn store_flags_batch(
          },
       };
       for (i, _uid, msgid) in &fresh {
-         match db_apply_flag_delta(pool, account_id, msgid, &add, &remove, new_modseq).await {
+         match apply_flag_delta(pool, account_id, msgid, &add, &remove, new_modseq).await {
             Ok(()) => {
                updated_ops.insert(*i);
             },
@@ -1373,7 +1373,10 @@ async fn drain_store(
    Ok(())
 }
 
-async fn db_apply_flag_delta(
+/// # Errors
+///
+/// Returns an error when the database operation fails.
+pub async fn apply_flag_delta(
    pool: &PgPool,
    account_id: &str,
    msgid: &str,

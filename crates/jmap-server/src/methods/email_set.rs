@@ -11,8 +11,12 @@ use std::{
 use futures_util::future;
 use imap_sync::{
    account::AccountRequest,
-   db::StateKind as DbStateKind,
+   db::{
+      self,
+      StateKind as DbStateKind,
+   },
    sync::{
+      self,
       is_valid_keyword,
       keyword_to_imap_flag,
    },
@@ -26,6 +30,7 @@ use tokio::{
    sync::oneshot,
    time,
 };
+use tracing::warn;
 
 use super::{
    MethodResult,
@@ -453,40 +458,110 @@ pub(crate) async fn apply_update(
 
    let touches_flags = !plan.flag_add.is_empty() || !plan.flag_remove.is_empty();
    let touches_mailboxes = !plan.mailbox_add.is_empty() || !plan.mailbox_remove.is_empty();
+   if !touches_flags && !touches_mailboxes {
+      return Ok(());
+   }
 
-   // A mixed patch dispatches two AccountRequest ops that aren't atomic on
-   // the IMAP side. Flags go first (idempotent, cheap to reconcile); if the
-   // mailbox half then fails we report exactly which half applied instead
-   // of pretending the whole patch failed. Real clients send mixed patches
-   // routinely (the post-send "move draft to sent + clear $draft" update),
-   // so rejecting them outright is not an option.
+   // Optimistic: the client-visible state is flags, memberships, and modseq.
+   // Apply those now and answer, the IMAP work runs behind the response and
+   // reverts the delta if the server refuses it.
    if touches_flags {
-      send_store_flags(state, account_id, msgid, plan.flag_add, plan.flag_remove).await?;
+      let new_modseq = db::bump_modseq(state.pool(), account_id, DbStateKind::Email)
+         .await
+         .map_err(
+            |err| serde_json::json!({"type": "serverFail", "description": err.to_string()}),
+         )?;
+      sync::apply_flag_delta(
+         state.pool(),
+         account_id,
+         msgid,
+         &plan.flag_add,
+         &plan.flag_remove,
+         new_modseq,
+      )
+      .await
+      .map_err(|err| serde_json::json!({"type": "serverFail", "description": err.to_string()}))?;
    }
    if touches_mailboxes {
-      send_mutate_mailboxes(
+      db::apply_membership_delta(
+         state.pool(),
+         account_id,
+         msgid,
+         &plan.mailbox_add,
+         &plan.mailbox_remove,
+      )
+      .await
+      .map_err(|err| serde_json::json!({"type": "serverFail", "description": err.to_string()}))?;
+   }
+
+   let bg_state = state.clone();
+   let bg_account = account_id.to_owned();
+   let bg_msgid = msgid.to_owned();
+   tokio::spawn(async move {
+      run_patch_imap(&bg_state, &bg_account, &bg_msgid, plan).await;
+   });
+   Ok(())
+}
+
+/// Flags go first, the post-send "move draft to sent + clear $draft" patch
+/// depends on that order. A failed half reverts its optimistic delta so the
+/// client refetches the true state.
+async fn run_patch_imap(state: &AppState, account_id: &str, msgid: &str, plan: UpdatePlan) {
+   if (!plan.flag_add.is_empty() || !plan.flag_remove.is_empty())
+      && let Err(err) = send_store_flags(
          state,
          account_id,
          msgid,
-         plan.mailbox_add,
-         plan.mailbox_remove,
+         plan.flag_add.clone(),
+         plan.flag_remove.clone(),
       )
       .await
-      .map_err(|err| {
-         if touches_flags {
-            serde_json::json!({
-                "type": "serverFail",
-                "description": format!(
-                    "keywords were applied but the mailboxIds change failed: {}",
-                    err.get("description").and_then(|desc| desc.as_str()).unwrap_or("unknown")
-                ),
-            })
-         } else {
-            err
-         }
-      })?;
+   {
+      warn!(
+         account_id,
+         msgid,
+         ?err,
+         "background flag store failed; reverting"
+      );
+      let revert = async {
+         let new_modseq = db::bump_modseq(state.pool(), account_id, DbStateKind::Email).await?;
+         sync::apply_flag_delta(
+            state.pool(),
+            account_id,
+            msgid,
+            &plan.flag_remove,
+            &plan.flag_add,
+            new_modseq,
+         )
+         .await
+      };
+      if let Err(err) = revert.await {
+         warn!(account_id, msgid, %err, "flag revert failed");
+      }
    }
-   Ok(())
+   if (!plan.mailbox_add.is_empty() || !plan.mailbox_remove.is_empty())
+      && let Err(err) = send_mutate_mailboxes(
+         state,
+         account_id,
+         msgid,
+         plan.mailbox_add.clone(),
+         plan.mailbox_remove.clone(),
+      )
+      .await
+   {
+      warn!(account_id, msgid, ?err, "background move failed; reverting");
+      if let Err(err) = db::apply_membership_delta(
+         state.pool(),
+         account_id,
+         msgid,
+         &plan.mailbox_remove,
+         &plan.mailbox_add,
+      )
+      .await
+      {
+         warn!(account_id, msgid, %err, "membership revert failed");
+      }
+   }
 }
 
 pub(crate) async fn apply_destroy(
