@@ -292,6 +292,7 @@ async fn run_once(
    if !imap::has_idle_capability(&mut session).await? {
       return Err(SyncError::IdleUnsupported);
    }
+   let traits = sync::detect_session_traits(&mut session).await?;
 
    let stats = sync::initial_sync(&mut session, pool, &runtime.id, runtime.backfill_days).await?;
    info!(
@@ -313,7 +314,7 @@ async fn run_once(
       // Select the primary folder each pass — cheap, and ensures the session
       // is in SELECTED state for IDLE even after a delta_sync touched other
       // folders in a later extension.
-      let _ = session.select(&primary).await?;
+      let primary_uv = session.select(&primary).await?.uid_validity.unwrap_or(0);
 
       let mut idle = session.idle();
       idle.init().await?;
@@ -409,7 +410,17 @@ async fn run_once(
          }
       }
 
-      if process_pending(pending, &mut session, pool, runtime).await == Flow::Exit {
+      if process_pending(
+         pending,
+         &mut session,
+         pool,
+         runtime,
+         traits,
+         Some((&primary, primary_uv)),
+      )
+      .await
+         == Flow::Exit
+      {
          return Ok(());
       }
       // If every sender has been dropped (e.g. reload without explicit
@@ -488,6 +499,7 @@ async fn process_request(
    session: &mut ImapSession,
    pool: &PgPool,
    runtime: &AccountRuntime,
+   traits: sync::SessionTraits,
 ) -> Flow {
    let account_id = runtime.id.as_str();
    match req {
@@ -511,11 +523,14 @@ async fn process_request(
          // Single-request path (the batch path unwraps to here on an
          // empty coalesce window). Reuse the batch helper with a
          // one-element vec so the STORE logic lives in exactly one place.
-         let result = sync::store_flags_batch(session, pool, account_id, &[sync::StoreFlagsOp {
-            msgid,
-            add,
-            remove,
-         }])
+         let result = sync::store_flags_batch(
+            session,
+            pool,
+            account_id,
+            &[sync::StoreFlagsOp { msgid, add, remove }],
+            traits,
+            None,
+         )
          .await;
          let resolved = result.into_iter().next().unwrap_or_else(|| {
             Err(SyncError::Other(
@@ -532,12 +547,12 @@ async fn process_request(
          respond,
       } => {
          let result =
-            sync::mutate_mailboxes(session, pool, account_id, &msgid, &add, &remove).await;
+            sync::mutate_mailboxes(session, pool, account_id, &msgid, &add, &remove, traits).await;
          let _ = respond.send(result);
          Flow::Continue
       },
       AccountRequest::DestroyMessage { msgid, respond } => {
-         let result = sync::destroy_message(session, pool, account_id, &msgid).await;
+         let result = sync::destroy_message(session, pool, account_id, &msgid, traits).await;
          let _ = respond.send(result);
          Flow::Continue
       },
@@ -552,10 +567,13 @@ async fn process_request(
             session,
             pool,
             account_id,
-            &blob_id,
-            &mailbox_id,
-            &flags,
-            received_at_secs,
+            sync::ImportSpec {
+               blob_id: &blob_id,
+               mailbox_id: &mailbox_id,
+               flags: &flags,
+               received_at_secs,
+            },
+            traits,
          )
          .await;
          let _ = respond.send(result);
@@ -572,6 +590,7 @@ async fn process_request(
             account_id,
             &name,
             parent_mailbox_id.as_deref(),
+            traits,
          )
          .await;
          let _ = respond.send(result);
@@ -638,6 +657,8 @@ async fn process_pending(
    session: &mut ImapSession,
    pool: &PgPool,
    runtime: &AccountRuntime,
+   traits: sync::SessionTraits,
+   selected: Option<(&str, u32)>,
 ) -> Flow {
    let account_id = runtime.id.as_str();
    let mut body_msgids = Vec::<String>::new();
@@ -689,14 +710,15 @@ async fn process_pending(
    }
 
    if !store_ops.is_empty() {
-      let results = sync::store_flags_batch(session, pool, account_id, &store_ops).await;
+      let results =
+         sync::store_flags_batch(session, pool, account_id, &store_ops, traits, selected).await;
       for (resp, res) in store_responders.into_iter().zip(results) {
          let _ = resp.send(res);
       }
    }
 
    for req in others {
-      if process_request(req, session, pool, runtime).await == Flow::Exit {
+      if process_request(req, session, pool, runtime, traits).await == Flow::Exit {
          return Flow::Exit;
       }
    }

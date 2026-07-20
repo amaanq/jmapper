@@ -85,12 +85,36 @@ pub struct SyncStats {
 /// Per-pass knobs threaded from the account task into every folder sync.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SyncOptions {
-   pub backfill_days:  u32,
+   pub backfill_days:   u32,
    /// Server advertises X-GM-EXT-1: prefer X-GM-THRID for threading.
-   pub gmail_thrid:    bool,
+   pub gmail_thrid:     bool,
    /// Interactive requests (move, destroy, import) reconcile with this off
    /// so a huge folder cannot turn one delete into a full-history fetch.
-   pub deepen_history: bool,
+   pub deepen_history:  bool,
+   /// The expunge sweep runs `UID SEARCH ALL`, seconds on six-figure
+   /// folders, so interactive reconciles skip it.
+   pub detect_expunges: bool,
+}
+
+/// Per-connection capabilities, probed once at login.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionTraits {
+   /// X-GM-EXT-1. Gmail flags are message-global and a trash move strips
+   /// every label, which lets interactive paths skip whole IMAP legs.
+   pub gmail:    bool,
+   pub has_move: bool,
+   pub uidplus:  bool,
+}
+
+/// # Errors
+///
+/// Returns [`SyncError`] if the CAPABILITY probe fails.
+pub async fn detect_session_traits(session: &mut ImapSession) -> Result<SessionTraits> {
+   Ok(SessionTraits {
+      gmail:    imap::has_capability(session, GMAIL_EXT_CAPABILITY).await?,
+      has_move: imap::has_capability(session, "MOVE").await?,
+      uidplus:  imap::has_capability(session, "UIDPLUS").await?,
+   })
 }
 
 async fn sync_options(session: &mut ImapSession, backfill_days: u32) -> SyncOptions {
@@ -101,13 +125,17 @@ async fn sync_options(session: &mut ImapSession, backfill_days: u32) -> SyncOpti
       backfill_days,
       gmail_thrid,
       deepen_history: true,
+      detect_expunges: true,
    }
 }
 
-async fn interactive_options(session: &mut ImapSession) -> SyncOptions {
-   let mut opts = sync_options(session, 0).await;
-   opts.deepen_history = false;
-   opts
+const fn interactive_options(traits: SessionTraits) -> SyncOptions {
+   SyncOptions {
+      backfill_days:   0,
+      gmail_thrid:     traits.gmail,
+      deepen_history:  false,
+      detect_expunges: false,
+   }
 }
 
 fn wants_history_deepening(opts: SyncOptions, previous_uidfirst: Option<u32>) -> bool {
@@ -1075,22 +1103,27 @@ pub async fn store_flags_batch(
    pool: &PgPool,
    account_id: &str,
    ops: &[StoreFlagsOp],
+   traits: SessionTraits,
+   selected: Option<(&str, u32)>,
 ) -> Vec<Result<()>> {
    type BucketKey = (String, Vec<String>, Vec<String>);
    if ops.is_empty() {
       return Vec::new();
    }
 
-   // Update every folder copy or reconciliation can restore stale flags.
+   // Generic IMAP flags are per-copy, so update every folder or
+   // reconciliation restores stale flags. Gmail flags are message-global and
+   // one STORE in the preferred location covers every label.
    let mut resolved = Vec::<(usize, String, u32, u32)>::new();
    let mut results = iter::repeat_with(|| None)
       .take(ops.len())
       .collect::<Vec<Option<Result<()>>>>();
-   for (i, op) in ops.iter().enumerate() {
+   if traits.gmail {
+      let msgids = ops.iter().map(|op| op.msgid.clone()).collect::<Vec<_>>();
       let rows = match db::client(pool).await {
          Ok(conn) => {
-            queries::messages::message_locations()
-               .bind(&conn, &account_id, &op.msgid.as_str())
+            queries::messages::preferred_message_locations()
+               .bind(&conn, &account_id, &msgids)
                .all()
                .await
                .map_err(SyncError::from)
@@ -1098,18 +1131,63 @@ pub async fn store_flags_batch(
          Err(err) => Err(err),
       };
       match rows {
-         Ok(rows) if rows.is_empty() => {
-            results[i] = Some(Err(SyncError::Other(format!(
-               "no message_imap row for msgid {}",
-               op.msgid
-            ))));
-         },
          Ok(rows) => {
-            for row in rows {
-               resolved.push((i, row.imap_name, row.uid as u32, row.uidvalidity as u32));
+            let by_msgid = rows
+               .into_iter()
+               .map(|row| (row.msgid.clone(), row))
+               .collect::<HashMap<_, _>>();
+            for (i, op) in ops.iter().enumerate() {
+               match by_msgid.get(&op.msgid) {
+                  Some(row) => {
+                     resolved.push((
+                        i,
+                        row.imap_name.clone(),
+                        row.uid as u32,
+                        row.uidvalidity as u32,
+                     ));
+                  },
+                  None => {
+                     results[i] = Some(Err(SyncError::Other(format!(
+                        "no message_imap row for msgid {}",
+                        op.msgid
+                     ))));
+                  },
+               }
             }
          },
-         Err(err) => results[i] = Some(Err(SyncError::Other(err.to_string()))),
+         Err(err) => {
+            let shared = err.to_string();
+            for slot in &mut results {
+               slot.get_or_insert_with(|| Err(SyncError::Other(shared.clone())));
+            }
+         },
+      }
+   } else {
+      for (i, op) in ops.iter().enumerate() {
+         let rows = match db::client(pool).await {
+            Ok(conn) => {
+               queries::messages::message_locations()
+                  .bind(&conn, &account_id, &op.msgid.as_str())
+                  .all()
+                  .await
+                  .map_err(SyncError::from)
+            },
+            Err(err) => Err(err),
+         };
+         match rows {
+            Ok(rows) if rows.is_empty() => {
+               results[i] = Some(Err(SyncError::Other(format!(
+                  "no message_imap row for msgid {}",
+                  op.msgid
+               ))));
+            },
+            Ok(rows) => {
+               for row in rows {
+                  resolved.push((i, row.imap_name, row.uid as u32, row.uidvalidity as u32));
+               }
+            },
+            Err(err) => results[i] = Some(Err(SyncError::Other(err.to_string()))),
+         }
       }
    }
 
@@ -1137,6 +1215,7 @@ pub async fn store_flags_batch(
       .take(ops.len())
       .collect::<Vec<Option<SyncError>>>();
    let mut updated_ops = BTreeSet::<usize>::new();
+   let mut live_selection = selected.map(|(name, uv)| (name.to_owned(), uv));
 
    for ((folder, add, remove), entries) in buckets {
       // Verify UIDVALIDITY by SELECTing the folder once.
@@ -1156,19 +1235,29 @@ pub async fn store_flags_batch(
             }
          };
 
-      let mbox = match session.select(&folder).await {
-         Ok(mailbox) => mailbox,
-         Err(source) => {
-            let err = SyncError::Other(format!("SELECT {folder}: {source}"));
-            let idxs = entries.iter().map(|(i, ..)| *i).collect::<Vec<usize>>();
-            mark_failed(&mut op_first_error, &idxs, &err);
-            continue;
+      // Skip the SELECT when the session already sits on this folder, it
+      // costs whole seconds on large Gmail folders.
+      let live_uv = match &live_selection {
+         Some((name, uv)) if *name == folder => *uv,
+         _ => {
+            match session.select(&folder).await {
+               Ok(mailbox) => {
+                  let uv = mailbox.uid_validity.unwrap_or(0);
+                  live_selection = Some((folder.clone(), uv));
+                  uv
+               },
+               Err(source) => {
+                  let err = SyncError::Other(format!("SELECT {folder}: {source}"));
+                  let idxs = entries.iter().map(|(i, ..)| *i).collect::<Vec<usize>>();
+                  mark_failed(&mut op_first_error, &idxs, &err);
+                  continue;
+               },
+            }
          },
       };
       // Per-bucket UIDVALIDITY check: if any entry in the bucket has a
       // stale uidvalidity, fail just those. Mismatches here are rare
       // unless the server reset the folder; surface them loudly.
-      let live_uv = mbox.uid_validity.unwrap_or(0);
       let fresh = entries
          .into_iter()
          .filter_map(|(i, uid, uv, msgid)| {
@@ -1373,12 +1462,11 @@ pub async fn mutate_mailboxes(
    msgid: &str,
    add: &[String],
    remove: &[String],
+   traits: SessionTraits,
 ) -> Result<()> {
    if add.is_empty() && remove.is_empty() {
       return Ok(());
    }
-
-   let has_move = imap::has_capability(session, "MOVE").await?;
 
    let locs = queries::messages::message_locations()
       .bind(&db::client(pool).await?, &account_id, &msgid)
@@ -1402,7 +1490,6 @@ pub async fn mutate_mailboxes(
 
    let add_folders = resolve_mailboxes(pool, account_id, add).await?;
    let remove_folders = resolve_mailboxes(pool, account_id, remove).await?;
-   let uidplus = imap::has_capability(session, "UIDPLUS").await?;
 
    let current = locs
       .iter()
@@ -1410,11 +1497,8 @@ pub async fn mutate_mailboxes(
       .collect::<HashMap<String, (u32, u32)>>();
 
    // Drop redundant membership operations before touching IMAP.
-   let net_remove = remove_folders
-      .iter()
-      .filter(|(_, name)| current.contains_key(name))
-      .cloned()
-      .collect::<Vec<(i64, String)>>();
+   let net_remove = net_memberships(&remove_folders, &current, true);
+   let net_adds = net_memberships(&add_folders, &current, false);
 
    // Strategy:
    //   * For each net-remove with a matching net-add, use UID MOVE (when
@@ -1423,35 +1507,44 @@ pub async fn mutate_mailboxes(
    //     requires UIDPLUS so we don't clobber other clients' pending \Deleted on a
    //     folder-wide EXPUNGE.
    //   * For any remaining net-adds, UID COPY from any current location.
-   let mut adds_iter = add_folders
-      .iter()
-      .filter(|(_, name)| !current.contains_key(name))
-      .cloned();
-   for (_, rm_name) in &net_remove {
-      let (rm_uid, rm_uv) = current[rm_name];
-      if has_move && let Some((_, dst_name)) = adds_iter.next() {
-         let mbox = session.select(rm_name).await?;
+   let mut next_add = 0_usize;
+   let mut label_stripping_move = false;
+   for rm in &net_remove {
+      let (rm_uid, rm_uv) = current[&rm.imap_name];
+      if label_stripping_move {
+         // The Gmail move into Trash or Spam already stripped every other
+         // label server-side.
+         continue;
+      }
+      if traits.has_move && next_add < net_adds.len() {
+         let dst = net_adds[next_add];
+         next_add += 1;
+         let mbox = session.select(&rm.imap_name).await?;
          let live_uv = mbox.uid_validity.unwrap_or(0);
          if live_uv != rm_uv {
             return Err(SyncError::UidValidityChanged {
-               folder: rm_name.clone(),
+               folder: rm.imap_name.clone(),
                was:    rm_uv,
                now:    live_uv,
             });
          }
-         session.uid_mv(rm_uid.to_string(), &dst_name).await?;
+         session.uid_mv(rm_uid.to_string(), &dst.imap_name).await?;
+         if traits.gmail && matches!(dst.role.as_deref(), Some("trash" | "junk")) {
+            label_stripping_move = true;
+         }
          continue;
       }
       // Fall-through: explicit STORE \Deleted + UID EXPUNGE.
-      if !uidplus {
+      if !traits.uidplus {
          return Err(SyncError::Other(format!(
-            "remove from {rm_name} requires UIDPLUS to scope EXPUNGE; server does not advertise it",
+            "remove from {} requires UIDPLUS to scope EXPUNGE; server does not advertise it",
+            rm.imap_name,
          )));
       }
-      let mbox = session.select(rm_name).await?;
+      let mbox = session.select(&rm.imap_name).await?;
       if mbox.uid_validity.unwrap_or(0) != rm_uv {
          return Err(SyncError::UidValidityChanged {
-            folder: rm_name.clone(),
+            folder: rm.imap_name.clone(),
             was:    rm_uv,
             now:    mbox.uid_validity.unwrap_or(0),
          });
@@ -1475,10 +1568,10 @@ pub async fn mutate_mailboxes(
    // location. Prefer one we haven't already removed via MOVE.
    let copy_source = locs
       .iter()
-      .find(|(_, name, ..)| !net_remove.iter().any(|(_, n)| n == name))
+      .find(|(_, name, ..)| !net_remove.iter().any(|rm| &rm.imap_name == name))
       .or_else(|| locs.first());
    if let Some((_, src_name, src_uid, src_uv)) = copy_source {
-      for (_, dst_name) in adds_iter {
+      for dst in &net_adds[next_add..] {
          let mbox = session.select(src_name).await?;
          if mbox.uid_validity.unwrap_or(0) != *src_uv {
             return Err(SyncError::UidValidityChanged {
@@ -1487,31 +1580,92 @@ pub async fn mutate_mailboxes(
                now:    mbox.uid_validity.unwrap_or(0),
             });
          }
-         session.uid_copy(src_uid.to_string(), &dst_name).await?;
+         session
+            .uid_copy(src_uid.to_string(), &dst.imap_name)
+            .await?;
       }
    }
 
-   // Reconcile the touched folders so the DB membership catches up. Real
-   // LIST entries, a synthesized folder without its role would clobber the
-   // mailbox's role and sort order.
-   let mut touched = add_folders
+   // We know exactly which placements moved, no need to sweep the sources.
+   let removed = net_remove
       .iter()
-      .chain(remove_folders.iter())
-      .map(|(_, n)| n.clone())
+      .map(|rm| (rm.folder_id, rm.mailbox_id.clone()))
+      .collect::<Vec<(i64, String)>>();
+   let added = net_adds
+      .iter()
+      .map(|dst| dst.mailbox_id.clone())
       .collect::<Vec<String>>();
-   touched.sort();
-   touched.dedup();
-   let opts = interactive_options(session).await;
-   let listed = imap::list_folders(session).await?;
-   for name in touched {
-      let Some(folder) = listed.iter().find(|folder| folder.name == name) else {
-         continue;
-      };
-      let _ = reconcile_folder(session, pool, account_id, folder, opts).await?;
+   apply_move_bookkeeping(pool, account_id, msgid, &removed, &added).await?;
+
+   // Only the destinations need a reconcile, to learn the new uids. Real
+   // LIST entries so the mailbox role is not clobbered.
+   if !net_adds.is_empty() {
+      let opts = interactive_options(traits);
+      let listed = imap::list_folders(session).await?;
+      for dst in &net_adds {
+         let Some(folder) = listed.iter().find(|folder| folder.name == dst.imap_name) else {
+            continue;
+         };
+         let _ = reconcile_folder(session, pool, account_id, folder, opts).await?;
+      }
    }
 
    db::recompute_mailbox_counts(pool, account_id).await?;
    Ok(())
+}
+
+fn net_memberships<'a>(
+   resolved: &'a [ResolvedMailbox],
+   current: &HashMap<String, (u32, u32)>,
+   want_member: bool,
+) -> Vec<&'a ResolvedMailbox> {
+   resolved
+      .iter()
+      .filter(|folder| current.contains_key(&folder.imap_name) == want_member)
+      .collect()
+}
+
+async fn apply_move_bookkeeping(
+   pool: &PgPool,
+   account_id: &str,
+   msgid: &str,
+   removed: &[(i64, String)],
+   added_mailboxes: &[String],
+) -> Result<()> {
+   if removed.is_empty() && added_mailboxes.is_empty() {
+      return Ok(());
+   }
+   let mut conn = db::client(pool).await?;
+   let tx = conn.transaction().await?;
+   for mailbox_id in added_mailboxes {
+      queries::messages::add_message_mailbox()
+         .bind(&tx, &account_id, &msgid, &mailbox_id.as_str())
+         .await?;
+   }
+   for (folder_id, mailbox_id) in removed {
+      queries::messages::delete_message_imap_placement()
+         .bind(&tx, &account_id, &msgid, folder_id)
+         .await?;
+      queries::messages::remove_message_mailbox()
+         .bind(&tx, &account_id, &msgid, &mailbox_id.as_str())
+         .await?;
+   }
+   let new_modseq = queries::state::bump_email_modseq()
+      .bind(&tx, &account_id)
+      .one()
+      .await?;
+   queries::messages::set_message_modseq()
+      .bind(&tx, &new_modseq, &account_id, &msgid)
+      .await?;
+   tx.commit().await?;
+   Ok(())
+}
+
+struct ResolvedMailbox {
+   folder_id:  i64,
+   imap_name:  String,
+   mailbox_id: String,
+   role:       Option<String>,
 }
 
 /// Look up folder ids + imap names for a list of JMAP mailbox ids.
@@ -1522,7 +1676,7 @@ async fn resolve_mailboxes(
    pool: &PgPool,
    account_id: &str,
    mailbox_ids: &[String],
-) -> Result<Vec<(i64, String)>> {
+) -> Result<Vec<ResolvedMailbox>> {
    if mailbox_ids.is_empty() {
       return Ok(Vec::new());
    }
@@ -1548,7 +1702,14 @@ async fn resolve_mailboxes(
    }
    Ok(rows
       .into_iter()
-      .map(|row| (row.id, row.imap_name))
+      .map(|row| {
+         ResolvedMailbox {
+            folder_id:  row.id,
+            imap_name:  row.imap_name,
+            mailbox_id: row.mailbox_id,
+            role:       row.role,
+         }
+      })
       .collect())
 }
 
@@ -1597,6 +1758,7 @@ pub async fn create_folder(
    account_id: &str,
    name: &str,
    parent_mailbox_id: Option<&str>,
+   traits: SessionTraits,
 ) -> Result<String> {
    if !is_valid_folder_name(name) {
       return Err(SyncError::Other(format!("invalid mailbox name {name:?}")));
@@ -1605,9 +1767,10 @@ pub async fn create_folder(
    let imap_name = match parent_mailbox_id {
       Some(pid) => {
          let parent = resolve_mailboxes(pool, account_id, &[pid.to_owned()]).await?;
-         let (_, parent_name) = parent
+         let parent_name = &parent
             .first()
-            .ok_or_else(|| SyncError::Other(format!("unknown parent mailbox {pid}")))?;
+            .ok_or_else(|| SyncError::Other(format!("unknown parent mailbox {pid}")))?
+            .imap_name;
          format!("{parent_name}{}{name}", delimiter_of(&live, parent_name))
       },
       None => name.to_owned(),
@@ -1631,7 +1794,7 @@ pub async fn create_folder(
             "created {imap_name:?} but the server does not list it"
          ))
       })?;
-   let opts = interactive_options(session).await;
+   let opts = interactive_options(traits);
    sync_folder(session, pool, account_id, folder, opts).await?;
 
    let folder = queries::folders::folder_by_name()
@@ -1668,10 +1831,11 @@ pub async fn rename_folder(
       )));
    }
    let resolved = resolve_mailboxes(pool, account_id, &[mailbox_id.to_owned()]).await?;
-   let (folder_id, old_imap) = resolved
+   let resolved = resolved
       .into_iter()
       .next()
       .ok_or_else(|| SyncError::Other(format!("unknown mailbox {mailbox_id}")))?;
+   let (folder_id, old_imap) = (resolved.folder_id, resolved.imap_name);
 
    let new_imap = if old_imap.starts_with("[Gmail]/") {
       format!("[Gmail]/{new_name}")
@@ -1764,10 +1928,11 @@ pub async fn delete_folder(
    mailbox_id: &str,
 ) -> Result<()> {
    let resolved = resolve_mailboxes(pool, account_id, &[mailbox_id.to_owned()]).await?;
-   let (folder_id, imap_name) = resolved
+   let resolved = resolved
       .into_iter()
       .next()
       .ok_or_else(|| SyncError::Other(format!("unknown mailbox {mailbox_id}")))?;
+   let (folder_id, imap_name) = (resolved.folder_id, resolved.imap_name);
 
    let live = imap::list_folders(session).await?;
    let delim = delimiter_of(&live, &imap_name);
@@ -1806,6 +1971,7 @@ pub async fn destroy_message(
    pool: &PgPool,
    account_id: &str,
    msgid: &str,
+   traits: SessionTraits,
 ) -> Result<()> {
    let locs = queries::messages::message_locations()
       .bind(&db::client(pool).await?, &account_id, &msgid)
@@ -1818,8 +1984,7 @@ pub async fn destroy_message(
       return Err(SyncError::Other(format!("unknown msgid {msgid}")));
    }
 
-   let uidplus = imap::has_capability(session, "UIDPLUS").await?;
-   if !uidplus {
+   if !traits.uidplus {
       // Without UIDPLUS, EXPUNGE is folder-wide — we'd clobber any
       // other client's pending \Deleted markers in the same folder.
       // Refuse rather than silently nuke unrelated mail.
@@ -1864,6 +2029,13 @@ pub async fn destroy_message(
    Ok(())
 }
 
+pub struct ImportSpec<'a> {
+   pub blob_id:          &'a str,
+   pub mailbox_id:       &'a str,
+   pub flags:            &'a [String],
+   pub received_at_secs: Option<i64>,
+}
+
 /// APPEND an uploaded message and reconcile it into the cache before returning.
 ///
 /// # Errors
@@ -1876,11 +2048,15 @@ pub async fn import_message(
    session: &mut ImapSession,
    pool: &PgPool,
    account_id: &str,
-   blob_id: &str,
-   mailbox_id: &str,
-   flags: &[String],
-   received_at_secs: Option<i64>,
+   spec: ImportSpec<'_>,
+   traits: SessionTraits,
 ) -> Result<ImportOutcome> {
+   let ImportSpec {
+      blob_id,
+      mailbox_id,
+      flags,
+      received_at_secs,
+   } = spec;
    let bytes = queries::blobs::get_uploaded_blob()
       .bind(&db::client(pool).await?, &account_id, &blob_id)
       .opt()
@@ -1888,11 +2064,12 @@ pub async fn import_message(
       .map(|row| row.bytes)
       .ok_or_else(|| SyncError::Other(format!("unknown uploaded blob {blob_id}")))?;
 
-   let (folder_id, imap_name) = resolve_mailboxes(pool, account_id, &[mailbox_id.to_owned()])
+   let resolved = resolve_mailboxes(pool, account_id, &[mailbox_id.to_owned()])
       .await?
       .into_iter()
       .next()
       .ok_or_else(|| SyncError::Other(format!("mailbox id {mailbox_id} has no IMAP folder")))?;
+   let (folder_id, imap_name) = (resolved.folder_id, resolved.imap_name);
 
    // A stable Message-ID distinguishes this APPEND from concurrent arrivals.
    let (append_bytes, message_id_search) = ensure_message_id(&bytes, account_id);
@@ -1927,7 +2104,7 @@ pub async fn import_message(
             "folder {folder_name_only} disappeared after APPEND"
          ))
       })?;
-   let opts = interactive_options(session).await;
+   let opts = interactive_options(traits);
    let _ = reconcile_folder(session, pool, account_id, &folder, opts).await?;
 
    // 6. Locate the appended message via its (now guaranteed-unique) Message-ID
@@ -2287,6 +2464,10 @@ async fn reconcile_folder(
 ) -> Result<u64> {
    // Its idempotent upsert only bumps modseq when rows actually change.
    let mut changed = sync_folder(session, pool, account_id, folder, opts).await?;
+
+   if !opts.detect_expunges {
+      return Ok(changed);
+   }
 
    // Look up the folder's cached id (sync_folder just upserted it).
    let cached_folder = queries::folders::folder_by_name()
@@ -2650,14 +2831,26 @@ mod tests {
    #[test]
    fn interactive_reconcile_never_touches_history() {
       let periodic = SyncOptions {
-         backfill_days:  0,
-         gmail_thrid:    false,
-         deepen_history: true,
+         backfill_days:   0,
+         gmail_thrid:     false,
+         deepen_history:  true,
+         detect_expunges: true,
       };
-      let interactive = SyncOptions {
-         deepen_history: false,
-         ..periodic
-      };
+      let interactive = interactive_options(SessionTraits {
+         gmail:    false,
+         has_move: true,
+         uidplus:  true,
+      });
+      assert!(!interactive.detect_expunges);
+      assert!(!interactive.deepen_history);
+      assert!(
+         interactive_options(SessionTraits {
+            gmail:    true,
+            has_move: true,
+            uidplus:  true,
+         })
+         .gmail_thrid
+      );
       assert!(wants_history_deepening(periodic, Some(250_865)));
       assert!(!wants_history_deepening(interactive, Some(250_865)));
       assert!(!wants_history_deepening(periodic, Some(1)));
@@ -2666,6 +2859,74 @@ mod tests {
          fresh_backfill_low(interactive, 340_000),
          340_000 - INITIAL_WINDOW
       );
+   }
+
+   #[tokio::test]
+   async fn move_bookkeeping_updates_placements_without_a_sweep() {
+      let Some(pool) = testkit::test_pool().await else {
+         return;
+      };
+      let client = pool.get().await.unwrap();
+      client
+         .batch_execute(
+            "INSERT INTO accounts (id, email, provider, display_name, bearer_token_hash, \
+             created_at) VALUES ('gmail', 'a@b.c', 'gmail', 'A', ''::bytea, 0);
+             INSERT INTO state (account_id) VALUES ('gmail');
+             INSERT INTO mailboxes (id, account_id, name, modseq) VALUES
+                ('mb_inbox', 'gmail', 'INBOX', 0),
+                ('mb_trash', 'gmail', 'Trash', 0);
+             INSERT INTO folders (account_id, imap_name, mailbox_id) VALUES
+                ('gmail', 'INBOX', 'mb_inbox'),
+                ('gmail', 'Trash', 'mb_trash');
+             INSERT INTO messages (account_id, msgid, thrid, received_at, size, modseq) VALUES
+                ('gmail', 'm1', 'm1', 0, 1, 0);
+             INSERT INTO message_imap (account_id, msgid, folder_id, uid, uidvalidity)
+             SELECT 'gmail', 'm1', id, 9, 1 FROM folders WHERE imap_name = 'INBOX';
+             INSERT INTO message_mailboxes (account_id, msgid, mailbox_id) VALUES
+                ('gmail', 'm1', 'mb_inbox');",
+         )
+         .await
+         .unwrap();
+      let inbox_folder: i64 = client
+         .query_one("SELECT id FROM folders WHERE imap_name = 'INBOX'", &[])
+         .await
+         .unwrap()
+         .get(0);
+      drop(client);
+
+      apply_move_bookkeeping(
+         &pool,
+         "gmail",
+         "m1",
+         &[(inbox_folder, "mb_inbox".to_owned())],
+         &["mb_trash".to_owned()],
+      )
+      .await
+      .unwrap();
+
+      let client = pool.get().await.unwrap();
+      let row = client
+         .query_one(
+            "SELECT
+                (SELECT COUNT(*) FROM message_imap WHERE folder_id = $1),
+                (SELECT COUNT(*) FROM message_mailboxes WHERE mailbox_id = 'mb_inbox'),
+                (SELECT COUNT(*) FROM message_mailboxes WHERE mailbox_id = 'mb_trash'),
+                (SELECT modseq FROM messages WHERE msgid = 'm1'),
+                (SELECT email_modseq FROM state WHERE account_id = 'gmail')",
+            &[&inbox_folder],
+         )
+         .await
+         .unwrap();
+      assert_eq!(row.get::<_, i64>(0), 0, "source placement removed");
+      assert_eq!(row.get::<_, i64>(1), 0, "source membership removed");
+      assert_eq!(row.get::<_, i64>(2), 1, "destination membership added");
+      let message_modseq: i64 = row.get(3);
+      let state_modseq: i64 = row.get(4);
+      assert_eq!(
+         message_modseq, state_modseq,
+         "message stamped so Email/changes reports the move"
+      );
+      assert!(state_modseq > 0);
    }
 
    #[test]

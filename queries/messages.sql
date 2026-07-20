@@ -155,3 +155,7 @@ DELETE FROM message_imap WHERE account_id = :account_id AND folder_id = :folder_
 
 --! count_message_imap
 SELECT COUNT(*) FROM message_imap WHERE account_id = :account_id AND msgid = :msgid;
+
+--! delete_message_imap_placement
+DELETE FROM message_imap
+WHERE account_id = :account_id AND msgid = :msgid AND folder_id = :folder_id;

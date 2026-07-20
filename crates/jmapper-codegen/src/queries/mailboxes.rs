@@ -140,28 +140,32 @@ impl<'a> From<MailboxRowBorrowed<'a>> for MailboxRow {
     }
 }
 #[derive(Debug, Clone, PartialEq)]
-pub struct ResolveMailboxFolders {
+pub struct ResolvedMailboxFolder {
     pub id: i64,
     pub imap_name: String,
     pub mailbox_id: String,
+    pub role: Option<String>,
 }
-pub struct ResolveMailboxFoldersBorrowed<'a> {
+pub struct ResolvedMailboxFolderBorrowed<'a> {
     pub id: i64,
     pub imap_name: &'a str,
     pub mailbox_id: &'a str,
+    pub role: Option<&'a str>,
 }
-impl<'a> From<ResolveMailboxFoldersBorrowed<'a>> for ResolveMailboxFolders {
+impl<'a> From<ResolvedMailboxFolderBorrowed<'a>> for ResolvedMailboxFolder {
     fn from(
-        ResolveMailboxFoldersBorrowed {
+        ResolvedMailboxFolderBorrowed {
             id,
             imap_name,
             mailbox_id,
-        }: ResolveMailboxFoldersBorrowed<'a>,
+            role,
+        }: ResolvedMailboxFolderBorrowed<'a>,
     ) -> Self {
         Self {
             id,
             imap_name: imap_name.into(),
             mailbox_id: mailbox_id.into(),
+            role: role.map(|v| v.into()),
         }
     }
 }
@@ -302,24 +306,24 @@ where
         Ok(mapped)
     }
 }
-pub struct ResolveMailboxFoldersQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+pub struct ResolvedMailboxFolderQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
     cached: Option<&'s tokio_postgres::Statement>,
     extractor:
-        fn(&tokio_postgres::Row) -> Result<ResolveMailboxFoldersBorrowed, tokio_postgres::Error>,
-    mapper: fn(ResolveMailboxFoldersBorrowed) -> T,
+        fn(&tokio_postgres::Row) -> Result<ResolvedMailboxFolderBorrowed, tokio_postgres::Error>,
+    mapper: fn(ResolvedMailboxFolderBorrowed) -> T,
 }
-impl<'c, 'a, 's, C, T: 'c, const N: usize> ResolveMailboxFoldersQuery<'c, 'a, 's, C, T, N>
+impl<'c, 'a, 's, C, T: 'c, const N: usize> ResolvedMailboxFolderQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
     pub fn map<R>(
         self,
-        mapper: fn(ResolveMailboxFoldersBorrowed) -> R,
-    ) -> ResolveMailboxFoldersQuery<'c, 'a, 's, C, R, N> {
-        ResolveMailboxFoldersQuery {
+        mapper: fn(ResolvedMailboxFolderBorrowed) -> R,
+    ) -> ResolvedMailboxFolderQuery<'c, 'a, 's, C, R, N> {
+        ResolvedMailboxFolderQuery {
             client: self.client,
             params: self.params,
             query: self.query,
@@ -778,7 +782,7 @@ impl RecomputeMailboxCountsStmt {
 pub struct ResolveMailboxFoldersStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn resolve_mailbox_folders() -> ResolveMailboxFoldersStmt {
     ResolveMailboxFoldersStmt(
-        "SELECT f.id, f.imap_name, m.id AS mailbox_id FROM folders f JOIN mailboxes m ON m.account_id = f.account_id AND m.id = f.mailbox_id WHERE f.account_id = $1 AND m.id = ANY($2)",
+        "SELECT f.id, f.imap_name, m.id AS mailbox_id, m.role FROM folders f JOIN mailboxes m ON m.account_id = f.account_id AND m.id = f.mailbox_id WHERE f.account_id = $1 AND m.id = ANY($2)",
         None,
     )
 }
@@ -803,22 +807,23 @@ impl ResolveMailboxFoldersStmt {
         client: &'c C,
         account_id: &'a T1,
         mailbox_ids: &'a T3,
-    ) -> ResolveMailboxFoldersQuery<'c, 'a, 's, C, ResolveMailboxFolders, 2> {
-        ResolveMailboxFoldersQuery {
+    ) -> ResolvedMailboxFolderQuery<'c, 'a, 's, C, ResolvedMailboxFolder, 2> {
+        ResolvedMailboxFolderQuery {
             client,
             params: [account_id, mailbox_ids],
             query: self.0,
             cached: self.1.as_ref(),
             extractor: |
                 row: &tokio_postgres::Row,
-            | -> Result<ResolveMailboxFoldersBorrowed, tokio_postgres::Error> {
-                Ok(ResolveMailboxFoldersBorrowed {
+            | -> Result<ResolvedMailboxFolderBorrowed, tokio_postgres::Error> {
+                Ok(ResolvedMailboxFolderBorrowed {
                     id: row.try_get(0)?,
                     imap_name: row.try_get(1)?,
                     mailbox_id: row.try_get(2)?,
+                    role: row.try_get(3)?,
                 })
             },
-            mapper: |it| ResolveMailboxFolders::from(it),
+            mapper: |it| ResolvedMailboxFolder::from(it),
         }
     }
 }
@@ -836,7 +841,7 @@ impl<
         'a,
         's,
         ResolveMailboxFoldersParams<T1, T2, T3>,
-        ResolveMailboxFoldersQuery<'c, 'a, 's, C, ResolveMailboxFolders, 2>,
+        ResolvedMailboxFolderQuery<'c, 'a, 's, C, ResolvedMailboxFolder, 2>,
         C,
     > for ResolveMailboxFoldersStmt
 {
@@ -844,7 +849,7 @@ impl<
         &'s self,
         client: &'c C,
         params: &'a ResolveMailboxFoldersParams<T1, T2, T3>,
-    ) -> ResolveMailboxFoldersQuery<'c, 'a, 's, C, ResolveMailboxFolders, 2> {
+    ) -> ResolvedMailboxFolderQuery<'c, 'a, 's, C, ResolvedMailboxFolder, 2> {
         self.bind(client, &params.account_id, &params.mailbox_ids)
     }
 }

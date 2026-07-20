@@ -72,7 +72,9 @@ UPDATE mailboxes m SET
 FROM changed
 WHERE m.id = changed.id;
 
---! resolve_mailbox_folders
-SELECT f.id, f.imap_name, m.id AS mailbox_id FROM folders f
+--: ResolvedMailboxFolder(role?)
+
+--! resolve_mailbox_folders : ResolvedMailboxFolder
+SELECT f.id, f.imap_name, m.id AS mailbox_id, m.role FROM folders f
 JOIN mailboxes m ON m.account_id = f.account_id AND m.id = f.mailbox_id
 WHERE f.account_id = :account_id AND m.id = ANY(:mailbox_ids);

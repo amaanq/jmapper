@@ -199,6 +199,12 @@ pub struct CountMessageImapParams<T1: crate::StringSql, T2: crate::StringSql> {
     pub account_id: T1,
     pub msgid: T2,
 }
+#[derive(Debug)]
+pub struct DeleteMessageImapPlacementParams<T1: crate::StringSql, T2: crate::StringSql> {
+    pub account_id: T1,
+    pub msgid: T2,
+    pub folder_id: i64,
+}
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnvelopeCmpRow {
     pub thrid: String,
@@ -2616,5 +2622,54 @@ impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::StringSql>
         params: &'a CountMessageImapParams<T1, T2>,
     ) -> I64Query<'c, 'a, 's, C, i64, 2> {
         self.bind(client, &params.account_id, &params.msgid)
+    }
+}
+pub struct DeleteMessageImapPlacementStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn delete_message_imap_placement() -> DeleteMessageImapPlacementStmt {
+    DeleteMessageImapPlacementStmt(
+        "DELETE FROM message_imap WHERE account_id = $1 AND msgid = $2 AND folder_id = $3",
+        None,
+    )
+}
+impl DeleteMessageImapPlacementStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub async fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::StringSql>(
+        &'s self,
+        client: &'c C,
+        account_id: &'a T1,
+        msgid: &'a T2,
+        folder_id: &'a i64,
+    ) -> Result<u64, tokio_postgres::Error> {
+        client
+            .execute(self.0, &[account_id, msgid, folder_id])
+            .await
+    }
+}
+impl<'a, C: GenericClient + Send + Sync, T1: crate::StringSql, T2: crate::StringSql>
+    crate::client::async_::Params<
+        'a,
+        'a,
+        'a,
+        DeleteMessageImapPlacementParams<T1, T2>,
+        std::pin::Pin<
+            Box<dyn futures::Future<Output = Result<u64, tokio_postgres::Error>> + Send + 'a>,
+        >,
+        C,
+    > for DeleteMessageImapPlacementStmt
+{
+    fn params(
+        &'a self,
+        client: &'a C,
+        params: &'a DeleteMessageImapPlacementParams<T1, T2>,
+    ) -> std::pin::Pin<
+        Box<dyn futures::Future<Output = Result<u64, tokio_postgres::Error>> + Send + 'a>,
+    > {
+        Box::pin(self.bind(client, &params.account_id, &params.msgid, &params.folder_id))
     }
 }
