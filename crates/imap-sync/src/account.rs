@@ -322,7 +322,7 @@ async fn run_once(
       // Scope the borrow so `wait_fut` and `stop_source` are dropped before
       // we call `idle.done()` (which takes `idle` by value).
       let (idle_result, pending_req) = {
-         let (wait_fut, _stop_source) = idle.wait_with_timeout(Duration::from_mins(28));
+         let (wait_fut, _stop_source) = idle.wait_with_timeout(Duration::from_mins(10));
          tokio::pin!(wait_fut);
          tokio::select! {
              idle_result = &mut wait_fut => (idle_result.map_err(SyncError::from), None),
@@ -332,54 +332,62 @@ async fn run_once(
 
       session = idle.done().await?;
       let idle_response = idle_result?;
-      let reconcile = idle_wake_needs_reconcile(&idle_response);
-      match idle_response {
+      // IDLE only reports the selected folder, a full sweep here would
+      // queue the next request behind eight SELECTs.
+      let changes = match idle_response {
          IdleResponse::NewData(_) => {
             debug!(account_id = %runtime.id, "idle: NewData, running delta sync");
+            sync::delta_sync(
+               &mut session,
+               pool,
+               &runtime.id,
+               &primary,
+               sync::SyncOptions {
+                  backfill_days:   runtime.backfill_days,
+                  gmail_thrid:     traits.gmail,
+                  deepen_history:  false,
+                  detect_expunges: false,
+               },
+            )
+            .await
          },
          IdleResponse::Timeout => {
-            debug!(account_id = %runtime.id, "idle: 28m timeout, re-arming");
+            debug!(account_id = %runtime.id, "idle: timeout, full reconcile");
+            sync::reconcile_all_folders(&mut session, pool, &runtime.id, runtime.backfill_days)
+               .await
          },
          IdleResponse::ManualInterrupt => {
             debug!(account_id = %runtime.id, "idle: manual interrupt");
+            Ok(0)
          },
-      }
-
-      if reconcile {
-         match sync::reconcile_all_folders(&mut session, pool, &runtime.id, runtime.backfill_days)
+      };
+      match changes {
+         Ok(n) if n > 0 => {
+            debug!(account_id = %runtime.id, changes = n, "sync applied changes");
+            if let Err(err) = sync::prefetch_recent_bodies(
+               &mut session,
+               pool,
+               &runtime.id,
+               BODY_CACHE_WINDOW,
+               INCREMENTAL_BODY_PREFETCH,
+            )
             .await
-         {
-            Ok(n) if n > 0 => {
-               debug!(
-                   account_id = %runtime.id,
-                   changes = n,
-                   "reconcile applied changes"
-               );
-               if let Err(err) = sync::prefetch_recent_bodies(
-                  &mut session,
-                  pool,
-                  &runtime.id,
-                  BODY_CACHE_WINDOW,
-                  INCREMENTAL_BODY_PREFETCH,
-               )
-               .await
-               {
-                  warn!(
-                     account_id = %runtime.id,
-                     error = %err,
-                     "incremental body prefetch failed; continuing",
-                  );
-               }
-            },
-            Ok(_) => {},
-            Err(err) => {
+            {
                warn!(
-                   account_id = %runtime.id,
-                   error = %err,
-                   "reconcile failed; continuing",
+                  account_id = %runtime.id,
+                  error = %err,
+                  "incremental body prefetch failed; continuing",
                );
-            },
-         }
+            }
+         },
+         Ok(_) => {},
+         Err(err) => {
+            warn!(
+                account_id = %runtime.id,
+                error = %err,
+                "post-idle sync failed; continuing",
+            );
+         },
       }
 
       // Collect every request that's already queued, plus the one that
@@ -484,10 +492,6 @@ async fn warm_body_cache(runtime: AccountRuntime, pool: PgPool) {
    }
 }
 
-const fn idle_wake_needs_reconcile(response: &IdleResponse) -> bool {
-   !matches!(response, IdleResponse::ManualInterrupt)
-}
-
 #[derive(Debug, PartialEq, Eq)]
 enum Flow {
    Continue,
@@ -500,6 +504,7 @@ async fn process_request(
    pool: &PgPool,
    runtime: &AccountRuntime,
    traits: sync::SessionTraits,
+   selected: Option<(&str, u32)>,
 ) -> Flow {
    let account_id = runtime.id.as_str();
    match req {
@@ -546,8 +551,10 @@ async fn process_request(
          remove,
          respond,
       } => {
-         let result =
-            sync::mutate_mailboxes(session, pool, account_id, &msgid, &add, &remove, traits).await;
+         let result = sync::mutate_mailboxes(
+            session, pool, account_id, &msgid, &add, &remove, traits, selected,
+         )
+         .await;
          let _ = respond.send(result);
          Flow::Continue
       },
@@ -718,7 +725,7 @@ async fn process_pending(
    }
 
    for req in others {
-      if process_request(req, session, pool, runtime, traits).await == Flow::Exit {
+      if process_request(req, session, pool, runtime, traits, selected).await == Flow::Exit {
          return Flow::Exit;
       }
    }
@@ -1041,11 +1048,5 @@ mod tests {
          folder("[Gmail]/Important", &["flagged"], None),
       ];
       pick_primary_folder(&folders, ProviderKind::Gmail).unwrap_err();
-   }
-
-   #[test]
-   fn interactive_idle_wake_skips_reconcile() {
-      assert!(!idle_wake_needs_reconcile(&IdleResponse::ManualInterrupt));
-      assert!(idle_wake_needs_reconcile(&IdleResponse::Timeout));
    }
 }

@@ -84,7 +84,7 @@ pub struct SyncStats {
 
 /// Per-pass knobs threaded from the account task into every folder sync.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct SyncOptions {
+pub struct SyncOptions {
    pub backfill_days:   u32,
    /// Server advertises X-GM-EXT-1: prefer X-GM-THRID for threading.
    pub gmail_thrid:     bool,
@@ -1455,6 +1455,10 @@ pub fn imap_flag_to_keyword(imap: &str) -> String {
 /// resolve to a folder, if a folder's UIDVALIDITY has rotated, if a remove is
 /// required but the server lacks UIDPLUS, or if any IMAP MOVE/COPY/STORE/
 /// EXPUNGE command fails.
+#[expect(
+   clippy::too_many_arguments,
+   reason = "serialized account-task entry point"
+)]
 pub async fn mutate_mailboxes(
    session: &mut ImapSession,
    pool: &PgPool,
@@ -1463,6 +1467,7 @@ pub async fn mutate_mailboxes(
    add: &[String],
    remove: &[String],
    traits: SessionTraits,
+   selected: Option<(&str, u32)>,
 ) -> Result<()> {
    if add.is_empty() && remove.is_empty() {
       return Ok(());
@@ -1497,8 +1502,12 @@ pub async fn mutate_mailboxes(
       .collect::<HashMap<String, (u32, u32)>>();
 
    // Drop redundant membership operations before touching IMAP.
-   let net_remove = net_memberships(&remove_folders, &current, true);
+   let mut net_remove = net_memberships(&remove_folders, &current, true);
    let net_adds = net_memberships(&add_folders, &current, false);
+   // The already-selected folder is a free move source.
+   if let Some((selected_name, _)) = selected {
+      net_remove.sort_by_key(|rm| rm.imap_name != selected_name);
+   }
 
    // Strategy:
    //   * For each net-remove with a matching net-add, use UID MOVE (when
@@ -1519,8 +1528,16 @@ pub async fn mutate_mailboxes(
       if traits.has_move && next_add < net_adds.len() {
          let dst = net_adds[next_add];
          next_add += 1;
-         let mbox = session.select(&rm.imap_name).await?;
-         let live_uv = mbox.uid_validity.unwrap_or(0);
+         let live_uv = match selected {
+            Some((name, uv)) if name == rm.imap_name => uv,
+            _ => {
+               session
+                  .select(&rm.imap_name)
+                  .await?
+                  .uid_validity
+                  .unwrap_or(0)
+            },
+         };
          if live_uv != rm_uv {
             return Err(SyncError::UidValidityChanged {
                folder: rm.imap_name.clone(),
@@ -1597,16 +1614,17 @@ pub async fn mutate_mailboxes(
       .collect::<Vec<String>>();
    apply_move_bookkeeping(pool, account_id, msgid, &removed, &added).await?;
 
-   // Only the destinations need a reconcile, to learn the new uids. Real
-   // LIST entries so the mailbox role is not clobbered.
+   // Only the destinations need a reconcile, to learn the new uids.
    if !net_adds.is_empty() {
       let opts = interactive_options(traits);
-      let listed = imap::list_folders(session).await?;
       for dst in &net_adds {
-         let Some(folder) = listed.iter().find(|folder| folder.name == dst.imap_name) else {
-            continue;
+         let folder = ImapFolder {
+            name:      dst.imap_name.clone(),
+            delimiter: '/',
+            flags:     vec![],
+            role:      dst.role.clone(),
          };
-         let _ = reconcile_folder(session, pool, account_id, folder, opts).await?;
+         let _ = reconcile_folder(session, pool, account_id, &folder, opts).await?;
       }
    }
 
@@ -2575,9 +2593,8 @@ pub async fn delta_sync(
    pool: &PgPool,
    account_id: &str,
    folder_name: &str,
-   backfill_days: u32,
+   opts: SyncOptions,
 ) -> Result<u64> {
-   let opts = sync_options(session, backfill_days).await;
    let mbox = session.select(folder_name).await?;
    let uidvalidity = mbox.uid_validity.unwrap_or(0);
    let uidnext = mbox.uid_next.unwrap_or(0);
