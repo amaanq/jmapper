@@ -8,6 +8,7 @@ use std::{
    time::Duration,
 };
 
+use futures_util::future;
 use imap_sync::{
    account::AccountRequest,
    db::StateKind as DbStateKind,
@@ -121,8 +122,19 @@ pub async fn set(state: &AppState, auth: &AccountInfo, args: serde_json::Value) 
    let mut updated = serde_json::Map::new();
    let mut not_updated = serde_json::Map::new();
    if let Some(update) = req.update {
-      for (msgid, patch) in update {
-         match apply_update(state, account_id, &msgid, &patch).await {
+      // Concurrent so the account task can coalesce same-target moves into
+      // one IMAP pipeline.
+      let results = future::join_all(update.iter().map(|(msgid, patch)| {
+         async move {
+            (
+               msgid.clone(),
+               apply_update(state, account_id, msgid, patch).await,
+            )
+         }
+      }))
+      .await;
+      for (msgid, result) in results {
+         match result {
             Ok(()) => {
                updated.insert(msgid, serde_json::Value::Null);
             },

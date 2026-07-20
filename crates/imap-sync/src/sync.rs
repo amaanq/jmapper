@@ -1104,7 +1104,7 @@ pub async fn store_flags_batch(
    account_id: &str,
    ops: &[StoreFlagsOp],
    traits: SessionTraits,
-   selected: Option<(&str, u32)>,
+   selection: &mut Option<(String, u32)>,
 ) -> Vec<Result<()>> {
    type BucketKey = (String, Vec<String>, Vec<String>);
    if ops.is_empty() {
@@ -1215,7 +1215,6 @@ pub async fn store_flags_batch(
       .take(ops.len())
       .collect::<Vec<Option<SyncError>>>();
    let mut updated_ops = BTreeSet::<usize>::new();
-   let mut live_selection = selected.map(|(name, uv)| (name.to_owned(), uv));
 
    for ((folder, add, remove), entries) in buckets {
       // Verify UIDVALIDITY by SELECTing the folder once.
@@ -1237,13 +1236,13 @@ pub async fn store_flags_batch(
 
       // Skip the SELECT when the session already sits on this folder, it
       // costs whole seconds on large Gmail folders.
-      let live_uv = match &live_selection {
+      let live_uv = match &*selection {
          Some((name, uv)) if *name == folder => *uv,
          _ => {
             match session.select(&folder).await {
                Ok(mailbox) => {
                   let uv = mailbox.uid_validity.unwrap_or(0);
-                  live_selection = Some((folder.clone(), uv));
+                  *selection = Some((folder.clone(), uv));
                   uv
                },
                Err(source) => {
@@ -1437,40 +1436,89 @@ pub fn imap_flag_to_keyword(imap: &str) -> String {
    }
 }
 
-/// Apply a mailbox-membership delta to a message over IMAP.
+pub struct MailboxMutation {
+   pub msgid:  String,
+   pub add:    Vec<String>,
+   pub remove: Vec<String>,
+}
+
+/// Apply mailbox-membership deltas over IMAP, one result per op.
 ///
 /// Prefers `UID MOVE` (RFC 6851) when the server advertises it: one RTT
 /// and atomic under concurrent writers. Falls back to `UID COPY` + `UID
-/// STORE +FLAGS (\Deleted)` + `UID EXPUNGE` / `UID EXPUNGE`-less EXPUNGE
-/// on servers without MOVE. The DB row's `message_mailboxes` set is
-/// updated in the same transaction as the modseq bump so `Email/changes`
-/// reflects the new membership.
-///
-/// `add` and `remove` use JMAP mailbox ids. An empty delta is a no-op.
+/// STORE +FLAGS (\Deleted)` + `UID EXPUNGE` on servers without MOVE. The
+/// destination reconcile and count recompute run once for the whole batch.
 ///
 /// # Errors
 ///
-/// Returns [`SyncError`] if a capability probe or database lookup fails, if
-/// `msgid` has no IMAP membership, if any `add`/`remove` mailbox id does not
-/// resolve to a folder, if a folder's UIDVALIDITY has rotated, if a remove is
-/// required but the server lacks UIDPLUS, or if any IMAP MOVE/COPY/STORE/
-/// EXPUNGE command fails.
-#[expect(
-   clippy::too_many_arguments,
-   reason = "serialized account-task entry point"
-)]
-pub async fn mutate_mailboxes(
+/// Each op errs if its msgid has no IMAP membership, a mailbox id does not
+/// resolve, a folder's UIDVALIDITY rotated, a remove needs UIDPLUS the
+/// server lacks, or an IMAP command fails. A failed batch tail fails every
+/// op that had succeeded.
+pub async fn mutate_mailboxes_batch(
    session: &mut ImapSession,
    pool: &PgPool,
    account_id: &str,
-   msgid: &str,
-   add: &[String],
-   remove: &[String],
+   ops: &[MailboxMutation],
    traits: SessionTraits,
-   selected: Option<(&str, u32)>,
-) -> Result<()> {
-   if add.is_empty() && remove.is_empty() {
-      return Ok(());
+   selection: &mut Option<(String, u32)>,
+) -> Vec<Result<()>> {
+   let mut results = Vec::with_capacity(ops.len());
+   let mut destinations = Vec::<(String, Option<String>)>::new();
+   for op in ops {
+      match mutate_one(session, pool, account_id, op, traits, selection).await {
+         Ok(dests) => {
+            for dest in dests {
+               if !destinations.iter().any(|(name, _)| *name == dest.0) {
+                  destinations.push(dest);
+               }
+            }
+            results.push(Ok(()));
+         },
+         Err(err) => results.push(Err(err)),
+      }
+   }
+
+   let finalize = async {
+      // Only the destinations need a reconcile, to learn the new uids.
+      let opts = interactive_options(traits);
+      for (name, role) in &destinations {
+         let folder = ImapFolder {
+            name:      name.clone(),
+            delimiter: '/',
+            flags:     vec![],
+            role:      role.clone(),
+         };
+         reconcile_folder(session, pool, account_id, &folder, opts).await?;
+         *selection = None;
+      }
+      if results.iter().any(StdResult::is_ok) {
+         db::recompute_mailbox_counts(pool, account_id).await?;
+      }
+      Ok::<(), SyncError>(())
+   };
+   if let Err(err) = finalize.await {
+      let shared = err.to_string();
+      for slot in &mut results {
+         if slot.is_ok() {
+            *slot = Err(SyncError::Other(shared.clone()));
+         }
+      }
+   }
+   results
+}
+
+async fn mutate_one(
+   session: &mut ImapSession,
+   pool: &PgPool,
+   account_id: &str,
+   op: &MailboxMutation,
+   traits: SessionTraits,
+   selection: &mut Option<(String, u32)>,
+) -> Result<Vec<(String, Option<String>)>> {
+   let msgid = op.msgid.as_str();
+   if op.add.is_empty() && op.remove.is_empty() {
+      return Ok(Vec::new());
    }
 
    let locs = queries::messages::message_locations()
@@ -1493,8 +1541,8 @@ pub async fn mutate_mailboxes(
       )));
    }
 
-   let add_folders = resolve_mailboxes(pool, account_id, add).await?;
-   let remove_folders = resolve_mailboxes(pool, account_id, remove).await?;
+   let add_folders = resolve_mailboxes(pool, account_id, &op.add).await?;
+   let remove_folders = resolve_mailboxes(pool, account_id, &op.remove).await?;
 
    let current = locs
       .iter()
@@ -1505,7 +1553,8 @@ pub async fn mutate_mailboxes(
    let mut net_remove = net_memberships(&remove_folders, &current, true);
    let net_adds = net_memberships(&add_folders, &current, false);
    // The already-selected folder is a free move source.
-   if let Some((selected_name, _)) = selected {
+   if let Some((selected_name, _)) = selection {
+      let selected_name = selected_name.clone();
       net_remove.sort_by_key(|rm| rm.imap_name != selected_name);
    }
 
@@ -1528,14 +1577,16 @@ pub async fn mutate_mailboxes(
       if traits.has_move && next_add < net_adds.len() {
          let dst = net_adds[next_add];
          next_add += 1;
-         let live_uv = match selected {
-            Some((name, uv)) if name == rm.imap_name => uv,
+         let live_uv = match &*selection {
+            Some((name, uv)) if *name == rm.imap_name => *uv,
             _ => {
-               session
+               let uv = session
                   .select(&rm.imap_name)
                   .await?
                   .uid_validity
-                  .unwrap_or(0)
+                  .unwrap_or(0);
+               *selection = Some((rm.imap_name.clone(), uv));
+               uv
             },
          };
          if live_uv != rm_uv {
@@ -1559,11 +1610,13 @@ pub async fn mutate_mailboxes(
          )));
       }
       let mbox = session.select(&rm.imap_name).await?;
-      if mbox.uid_validity.unwrap_or(0) != rm_uv {
+      let live_uv = mbox.uid_validity.unwrap_or(0);
+      *selection = Some((rm.imap_name.clone(), live_uv));
+      if live_uv != rm_uv {
          return Err(SyncError::UidValidityChanged {
             folder: rm.imap_name.clone(),
             was:    rm_uv,
-            now:    mbox.uid_validity.unwrap_or(0),
+            now:    live_uv,
          });
       }
       {
@@ -1589,12 +1642,19 @@ pub async fn mutate_mailboxes(
       .or_else(|| locs.first());
    if let Some((_, src_name, src_uid, src_uv)) = copy_source {
       for dst in &net_adds[next_add..] {
-         let mbox = session.select(src_name).await?;
-         if mbox.uid_validity.unwrap_or(0) != *src_uv {
+         let live_uv = match &*selection {
+            Some((name, uv)) if name == src_name => *uv,
+            _ => {
+               let uv = session.select(src_name).await?.uid_validity.unwrap_or(0);
+               *selection = Some((src_name.clone(), uv));
+               uv
+            },
+         };
+         if live_uv != *src_uv {
             return Err(SyncError::UidValidityChanged {
                folder: src_name.clone(),
                was:    *src_uv,
-               now:    mbox.uid_validity.unwrap_or(0),
+               now:    live_uv,
             });
          }
          session
@@ -1614,24 +1674,11 @@ pub async fn mutate_mailboxes(
       .collect::<Vec<String>>();
    apply_move_bookkeeping(pool, account_id, msgid, &removed, &added).await?;
 
-   // Only the destinations need a reconcile, to learn the new uids.
-   if !net_adds.is_empty() {
-      let opts = interactive_options(traits);
-      for dst in &net_adds {
-         let folder = ImapFolder {
-            name:      dst.imap_name.clone(),
-            delimiter: '/',
-            flags:     vec![],
-            role:      dst.role.clone(),
-         };
-         let _ = reconcile_folder(session, pool, account_id, &folder, opts).await?;
-      }
-   }
-
-   db::recompute_mailbox_counts(pool, account_id).await?;
-   Ok(())
+   Ok(net_adds
+      .into_iter()
+      .map(|dst| (dst.imap_name.clone(), dst.role.clone()))
+      .collect())
 }
-
 fn net_memberships<'a>(
    resolved: &'a [ResolvedMailbox],
    current: &HashMap<String, (u32, u32)>,
@@ -2576,6 +2623,28 @@ async fn apply_expunges(
    }
    tx.commit().await?;
    Ok(changed)
+}
+
+/// STATUS probe, which is a quarter of the cost of re-SELECTing a large folder.
+///
+/// # Errors
+///
+/// Returns [`SyncError`] if the STATUS command or the folder lookup fails.
+pub async fn primary_has_new_mail(
+   session: &mut ImapSession,
+   pool: &PgPool,
+   account_id: &str,
+   folder_name: &str,
+) -> Result<bool> {
+   let mbox = session.status(folder_name, "(UIDNEXT)").await?;
+   let stored = queries::folders::folder_by_name()
+      .bind(&db::client(pool).await?, &account_id, &folder_name)
+      .opt()
+      .await?;
+   let Some(stored) = stored else {
+      return Ok(true);
+   };
+   Ok(i64::from(mbox.uid_next.unwrap_or(0)) > stored.uidnext)
 }
 
 /// Delta sync — after an IDLE notification, fetch new UIDs since the folder's

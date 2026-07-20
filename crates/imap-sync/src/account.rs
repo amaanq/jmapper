@@ -332,34 +332,82 @@ async fn run_once(
 
       session = idle.done().await?;
       let idle_response = idle_result?;
-      // IDLE only reports the selected folder, a full sweep here would
-      // queue the next request behind eight SELECTs.
+      // Collect every request that's already queued, plus the one that
+      // interrupted IDLE. If any of them is a StoreFlags, give writers a
+      // 50 ms grace window to coalesce — multi-message "mark as read"
+      // operations fire N oneshots in quick succession and we want to
+      // emit one `UID STORE {uid,uid,...}` per folder, not N.
+      let mut pending = Vec::<AccountRequest>::new();
+      if let Some(req) = pending_req {
+         pending.push(req);
+      }
+      while let Ok(req) = rx.try_recv() {
+         pending.push(req);
+      }
+      if pending.iter().any(|request| {
+         matches!(
+            request,
+            AccountRequest::StoreFlags { .. } | AccountRequest::MutateMailboxes { .. }
+         )
+      }) {
+         let deadline = Instant::now() + Duration::from_millis(50);
+         loop {
+            tokio::select! {
+                () = time::sleep_until(deadline) => break,
+                req = rx.recv() => match req {
+                    None => break,
+                    Some(req) => pending.push(req),
+                }
+            }
+         }
+      }
+
+      if process_pending(
+         pending,
+         &mut session,
+         pool,
+         runtime,
+         traits,
+         Some((&primary, primary_uv)),
+      )
+      .await
+         == Flow::Exit
+      {
+         return Ok(());
+      }
+
+      // Wake-reason sync runs after the interactive requests so a click
+      // never queues behind our own mutation echoes. NewData is gated on a
+      // STATUS probe, most echoes carry no new uids and skip the SELECT.
       let changes = match idle_response {
          IdleResponse::NewData(_) => {
-            debug!(account_id = %runtime.id, "idle: NewData, running delta sync");
-            sync::delta_sync(
-               &mut session,
-               pool,
-               &runtime.id,
-               &primary,
-               sync::SyncOptions {
-                  backfill_days:   runtime.backfill_days,
-                  gmail_thrid:     traits.gmail,
-                  deepen_history:  false,
-                  detect_expunges: false,
+            match sync::primary_has_new_mail(&mut session, pool, &runtime.id, &primary).await {
+               Ok(false) => Ok(0),
+               Ok(true) => {
+                  debug!(account_id = %runtime.id, "idle: NewData, running delta sync");
+                  sync::delta_sync(
+                     &mut session,
+                     pool,
+                     &runtime.id,
+                     &primary,
+                     sync::SyncOptions {
+                        backfill_days:   runtime.backfill_days,
+                        gmail_thrid:     traits.gmail,
+                        deepen_history:  false,
+                        detect_expunges: false,
+                     },
+                  )
+                  .await
                },
-            )
-            .await
+               Err(err) => Err(err),
+            }
          },
          IdleResponse::Timeout => {
             debug!(account_id = %runtime.id, "idle: timeout, full reconcile");
             sync::reconcile_all_folders(&mut session, pool, &runtime.id, runtime.backfill_days)
                .await
          },
-         IdleResponse::ManualInterrupt => {
-            debug!(account_id = %runtime.id, "idle: manual interrupt");
-            Ok(0)
-         },
+         IdleResponse::ManualInterrupt => Ok(0),
       };
       match changes {
          Ok(n) if n > 0 => {
@@ -388,48 +436,6 @@ async fn run_once(
                 "post-idle sync failed; continuing",
             );
          },
-      }
-
-      // Collect every request that's already queued, plus the one that
-      // interrupted IDLE. If any of them is a StoreFlags, give writers a
-      // 50 ms grace window to coalesce — multi-message "mark as read"
-      // operations fire N oneshots in quick succession and we want to
-      // emit one `UID STORE {uid,uid,...}` per folder, not N.
-      let mut pending = Vec::<AccountRequest>::new();
-      if let Some(req) = pending_req {
-         pending.push(req);
-      }
-      while let Ok(req) = rx.try_recv() {
-         pending.push(req);
-      }
-      if pending
-         .iter()
-         .any(|request| matches!(request, AccountRequest::StoreFlags { .. }))
-      {
-         let deadline = Instant::now() + Duration::from_millis(50);
-         loop {
-            tokio::select! {
-                () = time::sleep_until(deadline) => break,
-                req = rx.recv() => match req {
-                    None => break,
-                    Some(req) => pending.push(req),
-                }
-            }
-         }
-      }
-
-      if process_pending(
-         pending,
-         &mut session,
-         pool,
-         runtime,
-         traits,
-         Some((&primary, primary_uv)),
-      )
-      .await
-         == Flow::Exit
-      {
-         return Ok(());
       }
       // If every sender has been dropped (e.g. reload without explicit
       // Shutdown), exit cleanly on the next iteration.
@@ -504,7 +510,6 @@ async fn process_request(
    pool: &PgPool,
    runtime: &AccountRuntime,
    traits: sync::SessionTraits,
-   selected: Option<(&str, u32)>,
 ) -> Flow {
    let account_id = runtime.id.as_str();
    match req {
@@ -528,13 +533,14 @@ async fn process_request(
          // Single-request path (the batch path unwraps to here on an
          // empty coalesce window). Reuse the batch helper with a
          // one-element vec so the STORE logic lives in exactly one place.
+         let mut selection = None;
          let result = sync::store_flags_batch(
             session,
             pool,
             account_id,
             &[sync::StoreFlagsOp { msgid, add, remove }],
             traits,
-            None,
+            &mut selection,
          )
          .await;
          let resolved = result.into_iter().next().unwrap_or_else(|| {
@@ -551,10 +557,18 @@ async fn process_request(
          remove,
          respond,
       } => {
-         let result = sync::mutate_mailboxes(
-            session, pool, account_id, &msgid, &add, &remove, traits, selected,
+         let result = sync::mutate_mailboxes_batch(
+            session,
+            pool,
+            account_id,
+            &[sync::MailboxMutation { msgid, add, remove }],
+            traits,
+            &mut None,
          )
-         .await;
+         .await
+         .into_iter()
+         .next()
+         .unwrap_or_else(|| Err(SyncError::Other("no mutate result".into())));
          let _ = respond.send(result);
          Flow::Continue
       },
@@ -668,10 +682,15 @@ async fn process_pending(
    selected: Option<(&str, u32)>,
 ) -> Flow {
    let account_id = runtime.id.as_str();
+   // Live view of the session's selected folder, shared by every op in this
+   // wake so none of them trusts a folder another op just switched away from.
+   let mut selection = selected.map(|(name, uv)| (name.to_owned(), uv));
    let mut body_msgids = Vec::<String>::new();
    let mut body_responders = Vec::<oneshot::Sender<Result<()>>>::new();
    let mut store_ops = Vec::<sync::StoreFlagsOp>::new();
    let mut store_responders = Vec::<oneshot::Sender<Result<()>>>::new();
+   let mut mutate_ops = Vec::<sync::MailboxMutation>::new();
+   let mut mutate_responders = Vec::<oneshot::Sender<Result<()>>>::new();
    let mut others = Vec::<AccountRequest>::new();
    for req in pending {
       match req {
@@ -696,7 +715,46 @@ async fn process_pending(
             store_ops.push(sync::StoreFlagsOp { msgid, add, remove });
             store_responders.push(respond);
          },
+         AccountRequest::MutateMailboxes {
+            msgid,
+            add,
+            remove,
+            respond,
+         } => {
+            mutate_ops.push(sync::MailboxMutation { msgid, add, remove });
+            mutate_responders.push(respond);
+         },
          other => others.push(other),
+      }
+   }
+
+   if !store_ops.is_empty() {
+      let results = sync::store_flags_batch(
+         session,
+         pool,
+         account_id,
+         &store_ops,
+         traits,
+         &mut selection,
+      )
+      .await;
+      for (resp, res) in store_responders.into_iter().zip(results) {
+         let _ = resp.send(res);
+      }
+   }
+
+   if !mutate_ops.is_empty() {
+      let results = sync::mutate_mailboxes_batch(
+         session,
+         pool,
+         account_id,
+         &mutate_ops,
+         traits,
+         &mut selection,
+      )
+      .await;
+      for (resp, res) in mutate_responders.into_iter().zip(results) {
+         let _ = resp.send(res);
       }
    }
 
@@ -716,16 +774,8 @@ async fn process_pending(
       }
    }
 
-   if !store_ops.is_empty() {
-      let results =
-         sync::store_flags_batch(session, pool, account_id, &store_ops, traits, selected).await;
-      for (resp, res) in store_responders.into_iter().zip(results) {
-         let _ = resp.send(res);
-      }
-   }
-
    for req in others {
-      if process_request(req, session, pool, runtime, traits, selected).await == Flow::Exit {
+      if process_request(req, session, pool, runtime, traits).await == Flow::Exit {
          return Flow::Exit;
       }
    }
