@@ -376,7 +376,9 @@ async fn run_once(
       if pending.iter().any(|request| {
          matches!(
             request,
-            AccountRequest::StoreFlags { .. } | AccountRequest::MutateMailboxes { .. }
+            AccountRequest::StoreFlags { .. }
+               | AccountRequest::MutateMailboxes { .. }
+               | AccountRequest::DestroyMessage { .. }
          )
       }) {
          let deadline = Instant::now() + Duration::from_millis(50);
@@ -602,7 +604,12 @@ async fn process_request(
          Flow::Continue
       },
       AccountRequest::DestroyMessage { msgid, respond } => {
-         let result = sync::destroy_message(session, pool, account_id, &msgid, traits).await;
+         let result =
+            sync::destroy_messages_batch(session, pool, account_id, &[msgid], traits, &mut None)
+               .await
+               .into_iter()
+               .next()
+               .unwrap_or_else(|| Err(SyncError::Other("no destroy result".into())));
          let _ = respond.send(result);
          Flow::Continue
       },
@@ -720,6 +727,8 @@ async fn process_pending(
    let mut store_responders = Vec::<oneshot::Sender<Result<()>>>::new();
    let mut mutate_ops = Vec::<sync::MailboxMutation>::new();
    let mut mutate_responders = Vec::<oneshot::Sender<Result<()>>>::new();
+   let mut destroy_msgids = Vec::<String>::new();
+   let mut destroy_responders = Vec::<oneshot::Sender<Result<()>>>::new();
    let mut others = Vec::<AccountRequest>::new();
    for req in pending {
       match req {
@@ -753,6 +762,10 @@ async fn process_pending(
             mutate_ops.push(sync::MailboxMutation { msgid, add, remove });
             mutate_responders.push(respond);
          },
+         AccountRequest::DestroyMessage { msgid, respond } => {
+            destroy_msgids.push(msgid);
+            destroy_responders.push(respond);
+         },
          other => others.push(other),
       }
    }
@@ -783,6 +796,21 @@ async fn process_pending(
       )
       .await;
       for (resp, res) in mutate_responders.into_iter().zip(results) {
+         let _ = resp.send(res);
+      }
+   }
+
+   if !destroy_msgids.is_empty() {
+      let results = sync::destroy_messages_batch(
+         session,
+         pool,
+         account_id,
+         &destroy_msgids,
+         traits,
+         &mut selection,
+      )
+      .await;
+      for (resp, res) in destroy_responders.into_iter().zip(results) {
          let _ = resp.send(res);
       }
    }

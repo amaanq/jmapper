@@ -114,8 +114,17 @@ pub async fn set(state: &AppState, auth: &AccountInfo, args: serde_json::Value) 
    let mut destroyed_ids = Vec::<String>::new();
    let mut not_destroyed = serde_json::Map::new();
    if let Some(destroy) = req.destroy {
-      for id in destroy {
-         match apply_destroy(state, account_id, &id).await {
+      // Concurrent so the account task can coalesce the expunges into one
+      // IMAP pipeline per folder.
+      let results = future::join_all(destroy.into_iter().map(|id| {
+         async move {
+            let result = apply_destroy(state, account_id, &id).await;
+            (id, result)
+         }
+      }))
+      .await;
+      for (id, result) in results {
+         match result {
             Ok(()) => destroyed_ids.push(id),
             Err(set_error) => {
                not_destroyed.insert(id, set_error);

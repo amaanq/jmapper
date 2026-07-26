@@ -2034,67 +2034,170 @@ pub async fn delete_folder(
 /// server lacks UIDPLUS (folder-wide EXPUNGE is refused), if a folder's
 /// UIDVALIDITY has rotated, if any IMAP STORE/EXPUNGE fails, or if the DB row
 /// cannot be deleted.
-pub async fn destroy_message(
+pub async fn destroy_messages_batch(
    session: &mut ImapSession,
    pool: &PgPool,
    account_id: &str,
-   msgid: &str,
+   msgids: &[String],
    traits: SessionTraits,
-) -> Result<()> {
-   let locs = queries::messages::message_locations()
-      .bind(&db::client(pool).await?, &account_id, &msgid)
-      .all()
-      .await?
-      .into_iter()
-      .map(|row| (row.imap_name, row.uid as u32, row.uidvalidity as u32))
-      .collect::<Vec<(String, u32, u32)>>();
-   if locs.is_empty() {
-      return Err(SyncError::Other(format!("unknown msgid {msgid}")));
+   selection: &mut Option<(String, u32)>,
+) -> Vec<Result<()>> {
+   if msgids.is_empty() {
+      return Vec::new();
    }
-
    if !traits.uidplus {
       // Without UIDPLUS, EXPUNGE is folder-wide — we'd clobber any
       // other client's pending \Deleted markers in the same folder.
       // Refuse rather than silently nuke unrelated mail.
-      return Err(SyncError::Other(
-         "Email/set destroy requires the IMAP UIDPLUS extension on this account; folder-wide \
-          EXPUNGE would risk clobbering unrelated \\Deleted messages"
-            .into(),
-      ));
+      return msgids
+         .iter()
+         .map(|_| {
+            Err(SyncError::Other(
+               "Email/set destroy requires the IMAP UIDPLUS extension on this account; \
+                folder-wide EXPUNGE would risk clobbering unrelated \\Deleted messages"
+                  .into(),
+            ))
+         })
+         .collect();
    }
-   for (folder, uid, uv) in &locs {
-      let mbox = session.select(folder).await?;
-      if mbox.uid_validity.unwrap_or(0) != *uv {
-         return Err(SyncError::UidValidityChanged {
-            folder: folder.clone(),
-            was:    *uv,
-            now:    mbox.uid_validity.unwrap_or(0),
-         });
-      }
-      {
-         let mut stream = session
-            .uid_store(uid.to_string(), r"+FLAGS.SILENT (\Deleted)")
-            .await?;
-         while let Some(resp) = stream.next().await {
-            let _ = resp?;
+
+   let mut op_first_error = iter::repeat_with(|| None)
+      .take(msgids.len())
+      .collect::<Vec<Option<SyncError>>>();
+   let mark_failed = |op_first_error: &mut [Option<SyncError>], idxs: &[usize], err: &SyncError| {
+      for i in idxs {
+         if op_first_error[*i].is_none() {
+            op_first_error[*i] = Some(SyncError::Other(err.to_string()));
          }
       }
-      let stream = session.uid_expunge(uid.to_string()).await?;
-      futures::pin_mut!(stream);
-      while let Some(resp) = stream.next().await {
-         let _ = resp?;
+   };
+
+   // Bucket placements by folder so destroying N messages costs one
+   // SELECT + STORE + EXPUNGE per folder, not per message. A message is
+   // destroyed only when every one of its placements expunged.
+   let mut folders = BTreeMap::<String, Vec<(usize, u32, u32)>>::new();
+   for (i, msgid) in msgids.iter().enumerate() {
+      let rows = match db::client(pool).await {
+         Ok(conn) => {
+            queries::messages::message_locations()
+               .bind(&conn, &account_id, &msgid.as_str())
+               .all()
+               .await
+               .map_err(SyncError::from)
+         },
+         Err(err) => Err(err),
+      };
+      match rows {
+         Ok(rows) if rows.is_empty() => {
+            op_first_error[i] = Some(SyncError::Other(format!("unknown msgid {msgid}")));
+         },
+         Ok(rows) => {
+            for row in rows {
+               folders
+                  .entry(row.imap_name)
+                  .or_default()
+                  .push((i, row.uid as u32, row.uidvalidity as u32));
+            }
+         },
+         Err(err) => op_first_error[i] = Some(err),
       }
    }
 
-   // Proactively drop the DB row so the caller's follow-up `Email/get`
+   for (folder, entries) in folders {
+      let live_uv = match &*selection {
+         Some((name, uv)) if *name == folder => *uv,
+         _ => {
+            match session.select(&folder).await {
+               Ok(mailbox) => {
+                  let uv = mailbox.uid_validity.unwrap_or(0);
+                  *selection = Some((folder.clone(), uv));
+                  uv
+               },
+               Err(source) => {
+                  let err = SyncError::Other(format!("SELECT {folder}: {source}"));
+                  let idxs = entries.iter().map(|(i, ..)| *i).collect::<Vec<usize>>();
+                  mark_failed(&mut op_first_error, &idxs, &err);
+                  continue;
+               },
+            }
+         },
+      };
+      let fresh = entries
+         .into_iter()
+         .filter_map(|(i, uid, uv)| {
+            if uv == live_uv {
+               Some((i, uid))
+            } else {
+               let err = SyncError::UidValidityChanged {
+                  folder: folder.clone(),
+                  was:    uv,
+                  now:    live_uv,
+               };
+               mark_failed(&mut op_first_error, &[i], &err);
+               None
+            }
+         })
+         .collect::<Vec<(usize, u32)>>();
+      if fresh.is_empty() {
+         continue;
+      }
+      let idxs = fresh.iter().map(|(i, _)| *i).collect::<Vec<usize>>();
+      let uid_set = fresh
+         .iter()
+         .map(|(_, uid)| uid.to_string())
+         .collect::<Vec<String>>()
+         .join(",");
+
+      if let Err(source) = drain_store(session, &uid_set, r"+FLAGS.SILENT (\Deleted)").await {
+         let err = SyncError::Other(format!("STORE \\Deleted: {source}"));
+         mark_failed(&mut op_first_error, &idxs, &err);
+         continue;
+      }
+      let expunged = async {
+         let stream = session.uid_expunge(&uid_set).await?;
+         futures::pin_mut!(stream);
+         while let Some(resp) = stream.next().await {
+            let _ = resp?;
+         }
+         Ok::<(), ImapError>(())
+      }
+      .await;
+      if let Err(source) = expunged {
+         let err = SyncError::Other(format!("UID EXPUNGE: {source}"));
+         mark_failed(&mut op_first_error, &idxs, &err);
+      }
+   }
+
+   // Proactively drop the DB rows so the caller's follow-up `Email/get`
    // returns `notFound` rather than stale data. CASCADE handles
    // message_imap + message_mailboxes + raw_messages.
-   let _ = db::bump_modseq(pool, account_id, db::StateKind::Email).await?;
-   queries::messages::delete_message()
-      .bind(&db::client(pool).await?, &account_id, &msgid)
-      .await?;
-   db::recompute_mailbox_counts(pool, account_id).await?;
-   Ok(())
+   let mut results = Vec::<Result<()>>::with_capacity(msgids.len());
+   let mut any_destroyed = false;
+   for (i, msgid) in msgids.iter().enumerate() {
+      if let Some(err) = op_first_error[i].take() {
+         results.push(Err(err));
+         continue;
+      }
+      let dropped = async {
+         queries::messages::delete_message()
+            .bind(&db::client(pool).await?, &account_id, &msgid.as_str())
+            .await?;
+         Ok::<(), SyncError>(())
+      }
+      .await;
+      any_destroyed |= dropped.is_ok();
+      results.push(dropped);
+   }
+   if any_destroyed {
+      let finalize = async {
+         let _ = db::bump_modseq(pool, account_id, db::StateKind::Email).await?;
+         db::recompute_mailbox_counts(pool, account_id).await
+      };
+      if let Err(err) = finalize.await {
+         warn!(account_id, error = %err, "post-destroy bookkeeping failed");
+      }
+   }
+   results
 }
 
 pub struct ImportSpec<'a> {
