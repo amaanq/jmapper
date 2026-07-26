@@ -240,9 +240,10 @@ async fn run_account(
 ) {
    let mut backoff = Duration::from_secs(2);
    let max_backoff = Duration::from_secs(300);
+   let mut carried = Option::<AccountRequest>::None;
 
    loop {
-      match run_once(&runtime, &pool, &mut rx).await {
+      match run_once(&runtime, &pool, &mut rx, &mut carried, &mut backoff).await {
          Ok(()) => {
             info!(account_id = %runtime.id, "account task exited cleanly");
             return;
@@ -270,7 +271,13 @@ async fn run_account(
                             info!(account_id = %runtime.id, "shutdown during backoff; exiting");
                             return;
                         }
-                        Some(_) => {} // drop other reqs during backoff
+                        Some(req) => {
+                            // A user is waiting on this. Cut the sleep short,
+                            // reconnect now, and serve it once the session is
+                            // back instead of dropping it on the floor.
+                            info!(account_id = %runtime.id, "request during backoff; reconnecting early");
+                            carried = Some(req);
+                        }
                     }
                 }
             }
@@ -284,6 +291,8 @@ async fn run_once(
    runtime: &AccountRuntime,
    pool: &PgPool,
    rx: &mut mpsc::Receiver<AccountRequest>,
+   carried: &mut Option<AccountRequest>,
+   backoff: &mut Duration,
 ) -> Result<()> {
    let mut session = connect_and_auth(runtime, pool).await?;
    info!(account_id = %runtime.id, "connected + authenticated");
@@ -293,6 +302,26 @@ async fn run_once(
       return Err(SyncError::IdleUnsupported);
    }
    let traits = sync::detect_session_traits(&mut session).await?;
+
+   // The connection is healthy again, so the next transient failure must not
+   // inherit a backoff escalated across days of unrelated disconnects.
+   *backoff = Duration::from_secs(2);
+
+   // Serve requests that queued while we were disconnected before the
+   // reconcile sweep below, which can take tens of seconds on large accounts.
+   let mut queued = Vec::<AccountRequest>::new();
+   if let Some(req) = carried.take() {
+      queued.push(req);
+   }
+   while let Ok(req) = rx.try_recv() {
+      queued.push(req);
+   }
+   if !queued.is_empty() {
+      info!(account_id = %runtime.id, n = queued.len(), "serving requests queued across reconnect");
+      if process_pending(queued, &mut session, pool, runtime, traits, None).await == Flow::Exit {
+         return Ok(());
+      }
+   }
 
    let stats = sync::initial_sync(&mut session, pool, &runtime.id, runtime.backfill_days).await?;
    info!(
