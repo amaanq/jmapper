@@ -1466,41 +1466,112 @@ pub async fn mutate_mailboxes_batch(
    traits: SessionTraits,
    selection: &mut Option<(String, u32)>,
 ) -> Vec<Result<()>> {
-   let mut results = Vec::with_capacity(ops.len());
-   let mut destinations = Vec::<(String, Option<String>)>::new();
+   let mut results = Vec::<Result<()>>::with_capacity(ops.len());
+   let mut outcomes = Vec::<Option<MoveOutcome>>::with_capacity(ops.len());
    for op in ops {
       match mutate_one(session, pool, account_id, op, traits, selection).await {
-         Ok(dests) => {
-            for dest in dests {
-               if !destinations.iter().any(|(name, _)| *name == dest.0) {
-                  destinations.push(dest);
-               }
-            }
+         Ok(outcome) => {
             results.push(Ok(()));
+            outcomes.push(Some(outcome));
          },
-         Err(err) => results.push(Err(err)),
+         Err(err) => {
+            results.push(Err(err));
+            outcomes.push(None);
+         },
       }
    }
 
-   let finalize = async {
-      // Only the destinations need a reconcile, to learn the new uids.
-      let opts = interactive_options(traits);
-      for (name, role) in &destinations {
+   // Only the destinations need a reconcile, to learn the new uids.
+   let opts = interactive_options(traits);
+   let mut reconciled = HashSet::<String>::new();
+   let mut reconcile_err = Option::<String>::None;
+   for outcome in outcomes.iter().flatten() {
+      for (_, name, role) in &outcome.dests {
+         if reconciled.contains(name) || reconcile_err.is_some() {
+            continue;
+         }
          let folder = ImapFolder {
             name:      name.clone(),
             delimiter: '/',
             flags:     vec![],
             role:      role.clone(),
          };
-         reconcile_folder(session, pool, account_id, &folder, opts).await?;
+         match reconcile_folder(session, pool, account_id, &folder, opts).await {
+            Ok(_) => {
+               reconciled.insert(name.clone());
+            },
+            Err(err) => reconcile_err = Some(err.to_string()),
+         }
          *selection = None;
       }
-      if results.iter().any(StdResult::is_ok) {
-         db::recompute_mailbox_counts(pool, account_id).await?;
+   }
+
+   // Bookkeeping runs only after the destination reconcile proves the
+   // message landed. A UID MOVE against a uid the server no longer has is a
+   // silent no-op, and blindly dropping the source placements would make the
+   // message vanish locally only to resurface on the next full sweep.
+   for (i, op) in ops.iter().enumerate() {
+      let Some(outcome) = &outcomes[i] else {
+         continue;
+      };
+      let msgid = op.msgid.as_str();
+      if let Some((_, name, _)) = outcome
+         .dests
+         .iter()
+         .find(|(_, name, _)| !reconciled.contains(name))
+      {
+         results[i] = Err(SyncError::Other(reconcile_err.as_ref().map_or_else(
+            || format!("destination {name} was not reconciled"),
+            |err| format!("reconcile of destination {name}: {err}"),
+         )));
+         continue;
       }
-      Ok::<(), SyncError>(())
-   };
-   if let Err(err) = finalize.await {
+      let verified = async {
+         if outcome.dests.is_empty() {
+            return Ok::<Option<&(i64, String, Option<String>)>, SyncError>(None);
+         }
+         let placed = queries::messages::message_locations()
+            .bind(&db::client(pool).await?, &account_id, &msgid)
+            .all()
+            .await?
+            .into_iter()
+            .map(|row| row.folder_id)
+            .collect::<HashSet<i64>>();
+         Ok(outcome
+            .dests
+            .iter()
+            .find(|(folder_id, ..)| !placed.contains(folder_id)))
+      }
+      .await;
+      match verified {
+         Ok(None) => {},
+         Ok(Some((_, name, _))) => {
+            warn!(
+                account_id,
+                msgid,
+                destination = %name,
+                "move did not land on the server, leaving local placements untouched",
+            );
+            results[i] = Err(SyncError::Other(format!(
+               "move of {msgid} to {name} did not land on the server"
+            )));
+            continue;
+         },
+         Err(err) => {
+            results[i] = Err(err);
+            continue;
+         },
+      }
+      if let Err(err) =
+         apply_move_bookkeeping(pool, account_id, msgid, &outcome.removed, &outcome.added).await
+      {
+         results[i] = Err(err);
+      }
+   }
+
+   if results.iter().any(StdResult::is_ok)
+      && let Err(err) = db::recompute_mailbox_counts(pool, account_id).await
+   {
       let shared = err.to_string();
       for slot in &mut results {
          if slot.is_ok() {
@@ -1511,6 +1582,17 @@ pub async fn mutate_mailboxes_batch(
    results
 }
 
+/// What a `mutate_one` did on the server, so the caller can verify and then
+/// apply the matching local bookkeeping.
+struct MoveOutcome {
+   /// `(folder_id, mailbox_id)` placements the server no longer holds.
+   removed: Vec<(i64, String)>,
+   /// Mailbox ids the message was added to.
+   added:   Vec<String>,
+   /// `(folder_id, imap_name, role)` of each destination folder.
+   dests:   Vec<(i64, String, Option<String>)>,
+}
+
 async fn mutate_one(
    session: &mut ImapSession,
    pool: &PgPool,
@@ -1518,10 +1600,14 @@ async fn mutate_one(
    op: &MailboxMutation,
    traits: SessionTraits,
    selection: &mut Option<(String, u32)>,
-) -> Result<Vec<(String, Option<String>)>> {
+) -> Result<MoveOutcome> {
    let msgid = op.msgid.as_str();
    if op.add.is_empty() && op.remove.is_empty() {
-      return Ok(Vec::new());
+      return Ok(MoveOutcome {
+         removed: Vec::new(),
+         added:   Vec::new(),
+         dests:   Vec::new(),
+      });
    }
 
    let locs = queries::messages::message_locations()
@@ -1667,20 +1753,22 @@ async fn mutate_one(
    }
 
    // We know exactly which placements moved, no need to sweep the sources.
-   let removed = net_remove
-      .iter()
-      .map(|rm| (rm.folder_id, rm.mailbox_id.clone()))
-      .collect::<Vec<(i64, String)>>();
-   let added = net_adds
-      .iter()
-      .map(|dst| dst.mailbox_id.clone())
-      .collect::<Vec<String>>();
-   apply_move_bookkeeping(pool, account_id, msgid, &removed, &added).await?;
-
-   Ok(net_adds
-      .into_iter()
-      .map(|dst| (dst.imap_name.clone(), dst.role.clone()))
-      .collect())
+   // Local bookkeeping is deferred to the caller, which first verifies the
+   // destination reconcile saw the message.
+   Ok(MoveOutcome {
+      removed: net_remove
+         .iter()
+         .map(|rm| (rm.folder_id, rm.mailbox_id.clone()))
+         .collect(),
+      added:   net_adds
+         .iter()
+         .map(|dst| dst.mailbox_id.clone())
+         .collect(),
+      dests:   net_adds
+         .into_iter()
+         .map(|dst| (dst.folder_id, dst.imap_name.clone(), dst.role.clone()))
+         .collect(),
+   })
 }
 fn net_memberships<'a>(
    resolved: &'a [ResolvedMailbox],
@@ -2093,10 +2181,11 @@ pub async fn destroy_messages_batch(
          },
          Ok(rows) => {
             for row in rows {
-               folders
-                  .entry(row.imap_name)
-                  .or_default()
-                  .push((i, row.uid as u32, row.uidvalidity as u32));
+               folders.entry(row.imap_name).or_default().push((
+                  i,
+                  row.uid as u32,
+                  row.uidvalidity as u32,
+               ));
             }
          },
          Err(err) => op_first_error[i] = Some(err),
@@ -3079,7 +3168,7 @@ mod tests {
          )
          .await
          .unwrap();
-      let inbox_folder: i64 = client
+      let inbox_folder = client
          .query_one("SELECT id FROM folders WHERE imap_name = 'INBOX'", &[])
          .await
          .unwrap()
@@ -3112,8 +3201,8 @@ mod tests {
       assert_eq!(row.get::<_, i64>(0), 0, "source placement removed");
       assert_eq!(row.get::<_, i64>(1), 0, "source membership removed");
       assert_eq!(row.get::<_, i64>(2), 1, "destination membership added");
-      let message_modseq: i64 = row.get(3);
-      let state_modseq: i64 = row.get(4);
+      let message_modseq = row.get::<_, i64>(3);
+      let state_modseq = row.get::<_, i64>(4);
       assert_eq!(
          message_modseq, state_modseq,
          "message stamped so Email/changes reports the move"
