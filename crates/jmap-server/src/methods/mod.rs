@@ -108,6 +108,13 @@ pub(crate) fn escape_like(value: &str) -> String {
       .replace('_', r"\_")
 }
 
+/// Substring pattern for a user search term. `*` acts as a wildcard, since
+/// Stalwart-tuned clients send prefix queries like `deadlock*` that would
+/// otherwise only match a literal asterisk.
+pub(crate) fn like_needle(value: &str) -> String {
+   format!("%{}%", escape_like(value).replace('*', "%"))
+}
+
 /// Renumber `?` placeholders into PostgreSQL's `$1..$N`. The dynamic query
 /// builders (filter compiler, sort variants) emit `?` for readability; no
 /// literal question mark ever appears inside the SQL text itself (user

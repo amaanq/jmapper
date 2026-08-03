@@ -60,7 +60,7 @@ use super::{
    bad_args,
    cached_state,
    enforce_get_limit,
-   escape_like,
+   like_needle,
    pg,
    pg_numbered,
    query_anchor_position,
@@ -972,15 +972,15 @@ fn compile_filter(condition: &EmailFilter) -> Result<CompiledFilter, MethodError
    }
    if let Some(query) = condition.subject.as_ref() {
       wheres.push("m.subject ILIKE ? ESCAPE '\\'".into());
-      binds.push(Bind::Str(format!("%{}%", escape_like(query))));
+      binds.push(Bind::Str(like_needle(query)));
    }
    if let Some(query) = condition.from.as_ref() {
       wheres.push("m.from_json ILIKE ? ESCAPE '\\'".into());
-      binds.push(Bind::Str(format!("%{}%", escape_like(query))));
+      binds.push(Bind::Str(like_needle(query)));
    }
    if let Some(query) = condition.to.as_ref() {
       wheres.push("m.to_json ILIKE ? ESCAPE '\\'".into());
-      binds.push(Bind::Str(format!("%{}%", escape_like(query))));
+      binds.push(Bind::Str(like_needle(query)));
    }
    if let Some(query) = condition.text.as_ref() {
       // Coarse "text" filter — matches subject, any address JSON, preview.
@@ -989,7 +989,7 @@ fn compile_filter(condition: &EmailFilter) -> Result<CompiledFilter, MethodError
           ESCAPE '\\' OR m.preview ILIKE ? ESCAPE '\\')"
             .into(),
       );
-      let needle = format!("%{}%", escape_like(query));
+      let needle = like_needle(query);
       binds.push(Bind::Str(needle.clone()));
       binds.push(Bind::Str(needle.clone()));
       binds.push(Bind::Str(needle.clone()));
@@ -1033,7 +1033,7 @@ fn compile_filter(condition: &EmailFilter) -> Result<CompiledFilter, MethodError
    for (field, col) in [(&condition.cc, "cc_json"), (&condition.bcc, "bcc_json")] {
       for query in field.iter().flatten() {
          wheres.push(format!("m.{col} ILIKE ? ESCAPE '\\'"));
-         binds.push(Bind::Str(format!("%{}%", escape_like(query))));
+         binds.push(Bind::Str(like_needle(query)));
       }
    }
    if let Some(query) = condition.body.as_ref() {
@@ -1047,7 +1047,7 @@ fn compile_filter(condition: &EmailFilter) -> Result<CompiledFilter, MethodError
           '\\'))"
             .into(),
       );
-      let needle = format!("%{}%", escape_like(query));
+      let needle = like_needle(query);
       binds.push(Bind::Str(needle.clone()));
       binds.push(Bind::Str(needle));
    }
@@ -1286,6 +1286,16 @@ mod filter_tests {
       let compiled = compile_filter_tree(&filter).unwrap();
       assert!(!compiled.where_clause.contains("NOT IN"));
       assert!(compiled.binds.is_empty());
+   }
+
+   #[test]
+   fn text_wildcards_become_sql_wildcards() {
+      let filter = parse(r#"{"text":"deadlock*"}"#);
+      let compiled = compile_filter_tree(&filter).unwrap();
+      match &compiled.binds[0] {
+         Bind::Str(needle) => assert_eq!(needle, "%deadlock%%"),
+         other => panic!("expected string bind, got {other:?}"),
+      }
    }
 
    #[test]
