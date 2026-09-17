@@ -1,9 +1,12 @@
 //! PostgreSQL pool setup and schema migrations.
 
+use std::num::NonZeroUsize;
+
 use deadpool_postgres::{
    Config,
    ManagerConfig,
    Pool,
+   PoolConfig,
    RecyclingMethod,
    Runtime,
 };
@@ -27,17 +30,23 @@ const MIGRATIONS: &[&str] = &[
 /// dbname=jmapper`). `NoTls` only: the supported deployments talk to postgres
 /// over a local unix socket or localhost.
 ///
+/// `max_connections` caps the pool. deadpool's own default is
+/// `logical_cpus * 2`, which on a large host reserves more of `max_connections`
+/// than a postgres shared with other services can spare.
+///
 /// # Errors
 ///
 /// Returns an error when the pool cannot be created or a schema migration
 /// fails.
 #[inline]
-pub async fn open(url: &str) -> Result<Pool> {
+pub async fn open(url: &str, max_connections: NonZeroUsize) -> Result<Pool> {
    let mut cfg = Config::new();
    cfg.url = Some(url.to_owned());
    cfg.manager = Some(ManagerConfig {
       recycling_method: RecyclingMethod::Fast,
    });
+   cfg.pool = Some(PoolConfig::new(max_connections.get()));
+
    let pool = cfg
       .create_pool(Some(Runtime::Tokio1), NoTls)
       .map_err(|err| SyncError::Other(format!("building postgres pool: {err}")))?;
@@ -100,6 +109,8 @@ async fn migrate(client: &mut tokio_postgres::Client) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+   use std::num::NonZeroUsize;
+
    use tokio_postgres::{
       Client,
       NoTls,
@@ -151,7 +162,9 @@ mod tests {
          .unwrap();
       drop(client);
 
-      open(&url).await.unwrap();
+      open(&url, NonZeroUsize::new(4).expect("4 is nonzero"))
+         .await
+         .unwrap();
 
       let client = connect(&url).await;
       let row = client

@@ -4,6 +4,7 @@ use std::{
    collections::HashSet,
    fs,
    net::SocketAddr,
+   num::NonZeroUsize,
    path::Path,
 };
 
@@ -36,6 +37,10 @@ pub struct Server {
    /// libpq-style connection string, e.g. `host=/run/postgresql dbname=jmapper`
    /// or `host=localhost user=jmapper password=… dbname=jmapper`.
    pub database_url:              String,
+   /// Upper bound on pooled postgres connections. Sized for a postgres shared
+   /// with other services rather than for the host's core count.
+   #[serde(default = "default_max_db_connections")]
+   pub max_db_connections:        NonZeroUsize,
    /// Seconds between background CalDAV/CardDAV refresh rounds. Zero
    /// disables periodic refresh; JMAP writes and explicit initial syncs
    /// still use the configured endpoints.
@@ -70,6 +75,10 @@ const fn default_backfill_days() -> u32 {
 
 const fn default_dav_sync_interval_seconds() -> u64 {
    60
+}
+
+const fn default_max_db_connections() -> NonZeroUsize {
+   NonZeroUsize::new(8).expect("8 is nonzero")
 }
 
 #[derive(Clone, Deserialize)]

@@ -2,6 +2,7 @@
 
 use std::{
    env,
+   num::NonZeroUsize,
    process,
    sync::atomic::{
       AtomicU64,
@@ -41,7 +42,7 @@ pub async fn test_pool() -> Option<Pool> {
 
 async fn fresh_db(admin_url: &str) -> Result<Pool> {
    let url = create_empty_db(admin_url).await?;
-   cache::open(&url).await
+   cache::open(&url, NonZeroUsize::new(4).expect("4 is nonzero")).await
 }
 
 /// Create an unmigrated database for migration tests.

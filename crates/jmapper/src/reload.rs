@@ -547,7 +547,8 @@ pub async fn stop_dav_one(id: &str, managed: ManagedDav) {
 fn warn_if_immutable_changed_early(_new: &Config) {
    tracing::debug!(
       "hot reload applies to [[accounts]] only; `server.bind`, `server.session_url`, \
-       `server.cors_origins`, and `server.database_url` changes require a full restart"
+       `server.cors_origins`, `server.database_url`, and `server.max_db_connections` changes \
+       require a full restart"
    );
 }
 

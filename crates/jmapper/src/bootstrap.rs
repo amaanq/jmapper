@@ -201,9 +201,12 @@ async fn write_tokens_to_cache(
    account: &Account,
    tokens: &ExchangedTokens,
 ) -> Result<()> {
-   let pool = cache::open(&config.server.database_url)
-      .await
-      .context("connecting to postgres / initializing schema")?;
+   let pool = cache::open(
+      &config.server.database_url,
+      config.server.max_db_connections,
+   )
+   .await
+   .context("connecting to postgres / initializing schema")?;
 
    let hash = {
       let mut hasher = Sha256::new();

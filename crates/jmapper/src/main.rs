@@ -109,9 +109,12 @@ async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
       state::DavAvailability,
    };
 
-   let pool = cache::open(&config.server.database_url)
-      .await
-      .context("connecting to postgres / initializing schema")?;
+   let pool = cache::open(
+      &config.server.database_url,
+      config.server.max_db_connections,
+   )
+   .await
+   .context("connecting to postgres / initializing schema")?;
 
    let mut http_accounts = Vec::with_capacity(config.accounts.len());
    let mut account_senders = HashMap::new();

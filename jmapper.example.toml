@@ -5,6 +5,9 @@ session_url  = "http://localhost:8765"
 # libpq-style connection string; unix socket peer auth is the intended
 # production shape (`host=/run/postgresql`), TCP works for dev.
 database_url = "host=/tmp dbname=jmapper"
+# Pool ceiling. Every service on the host draws from one postgres
+# `max_connections` budget, so raise this only if there are slots to spare.
+max_db_connections = 8
 # CalDAV/CardDAV refresh cadence. Set to 0 to disable periodic refresh.
 dav_sync_interval_seconds = 60
 
