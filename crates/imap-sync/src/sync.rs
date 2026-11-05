@@ -704,16 +704,61 @@ fn addresses(addrs: Option<&[async_imap::imap_proto::Address]>) -> Option<Vec<Em
             .as_deref()
             .and_then(|bytes| from_utf8(bytes).ok())?;
          let email = format!("{mailbox}@{host}");
-         let name = addr.name.as_deref().and_then(decode_envelope_text);
+         let name = addr
+            .name
+            .as_deref()
+            .and_then(decode_envelope_text)
+            .map(unquote_display_name)
+            .filter(|name| !name.is_empty());
          Some(EmailAddress { name, email })
       })
       .collect::<Vec<EmailAddress>>();
    if out.is_empty() { None } else { Some(out) }
 }
 
+/// imap-proto 0.16 leaves quoted strings escaped and cannot flag literals.
+fn unescape_imap_quoted(value: &[u8]) -> Vec<u8> {
+   let mut out = Vec::with_capacity(value.len());
+   let mut bytes = value.iter().copied().peekable();
+
+   while let Some(byte) = bytes.next() {
+      if byte == b'\\' && matches!(bytes.peek(), Some(b'\\' | b'"')) {
+         out.extend(bytes.next());
+      } else {
+         out.push(byte);
+      }
+   }
+
+   out
+}
+
+/// Zoho sends the RFC 5322 quotes of a display name inside the ENVELOPE name.
+fn unquote_display_name(name: String) -> String {
+   let Some(inner) = name
+      .strip_prefix('"')
+      .and_then(|rest| rest.strip_suffix('"'))
+   else {
+      return name;
+   };
+
+   let mut out = String::with_capacity(inner.len());
+   let mut chars = inner.chars();
+
+   while let Some(ch) = chars.next() {
+      if ch == '\\' {
+         out.extend(chars.next());
+      } else {
+         out.push(ch);
+      }
+   }
+
+   out
+}
+
 fn decode_envelope_text(value: &[u8]) -> Option<String> {
-   let mut terminated = Vec::with_capacity(value.len() + 1);
-   terminated.extend_from_slice(value);
+   let unescaped = unescape_imap_quoted(value);
+   let mut terminated = Vec::with_capacity(unescaped.len() + 1);
+   terminated.extend_from_slice(&unescaped);
    terminated.push(b'\n');
    mail_parser::parsers::MessageStream::new(&terminated)
       .parse_unstructured()
@@ -3245,6 +3290,20 @@ mod tests {
          decode_envelope_text(b"Plain subject").as_deref(),
          Some("Plain subject")
       );
+   }
+
+   #[test]
+   fn envelope_text_drops_imap_escapes_and_display_name_quotes() {
+      let subject = decode_envelope_text(br#"Export details for folder \"Sent\""#);
+      assert_eq!(
+         subject.as_deref(),
+         Some(r#"Export details for folder "Sent""#)
+      );
+
+      let name = decode_envelope_text(br#"\"Porkbun Support Dept.\""#).map(unquote_display_name);
+      assert_eq!(name.as_deref(), Some("Porkbun Support Dept."));
+      assert_eq!(unquote_display_name("Plain Name".into()), "Plain Name");
+      assert_eq!(unquote_display_name(r#""a \"b\" c""#.into()), r#"a "b" c"#);
    }
 
    #[tokio::test]
