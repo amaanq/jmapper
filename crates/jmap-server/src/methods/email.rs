@@ -1292,10 +1292,11 @@ mod filter_tests {
    fn text_wildcards_become_sql_wildcards() {
       let filter = parse(r#"{"text":"deadlock*"}"#);
       let compiled = compile_filter_tree(&filter).unwrap();
-      match &compiled.binds[0] {
-         Bind::Str(needle) => assert_eq!(needle, "%deadlock%%"),
-         other => panic!("expected string bind, got {other:?}"),
-      }
+      assert!(
+         matches!(&compiled.binds[0], Bind::Str(needle) if needle == "%deadlock%%"),
+         "{:?}",
+         compiled.binds[0]
+      );
    }
 
    #[test]
