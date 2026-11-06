@@ -8,7 +8,7 @@ no-default-features = false
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = [ "https://github.com/rustsec/advisory-db" ]
-ignore  = [  ]
+ignore  = [ { id = "RUSTSEC-2026-0441", reason = "pin-utils comes from async-imap, and async-imap 0.12 still depends on it" } ]
 version = 2
 yanked  = "warn"
 
