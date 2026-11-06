@@ -1805,10 +1805,7 @@ async fn mutate_one(
          .iter()
          .map(|rm| (rm.folder_id, rm.mailbox_id.clone()))
          .collect(),
-      added:   net_adds
-         .iter()
-         .map(|dst| dst.mailbox_id.clone())
-         .collect(),
+      added:   net_adds.iter().map(|dst| dst.mailbox_id.clone()).collect(),
       dests:   net_adds
          .into_iter()
          .map(|dst| (dst.folder_id, dst.imap_name.clone(), dst.role.clone()))
